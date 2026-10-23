@@ -1,0 +1,52 @@
+# .github/dependabot.yml — Dependabot version updates
+#
+# Only the ecosystems this repo has manifests for: Go modules (go.mod), GitHub
+# Actions (.github/workflows/*.yml), and the Dockerfile at the repo root
+# (base-image bumps).
+#
+# Each ecosystem carries a semver:* label so release intent is explicit:
+# actions are CI-only (semver:none); gomod and docker change the shipped
+# image (semver:patch).
+version: 2
+updates:
+  # --- CI actions ---
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore", "semver:none"]
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # --- Go modules ---
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore", "semver:patch"]
+    commit-message:
+      prefix: "deps(gomod)"
+    groups:
+      go:
+        patterns: ["*"]
+
+  # --- Docker (image base) ---
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore", "semver:patch"]
+    commit-message:
+      prefix: "deps(docker)"
+    groups:
+      docker:
+        patterns: ["*"]
