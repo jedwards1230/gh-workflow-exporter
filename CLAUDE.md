@@ -16,7 +16,7 @@ as a stable API.
 | `main.go` | Flags/env (flags > env > defaults), credential + config loading, HTTP server (`/metrics`, `/healthz`, `/readyz`), signal handling |
 | `internal/config` | YAML config (include/exclude/overrides, strict keys, validation) and App credentials from env or the secret dir |
 | `internal/github` | Sequential REST client: App JWT → installation token (cached, re-minted <10 min before expiry, once on 401), ETag cache with per-poll eviction, Link pagination, error kinds, request stats |
-| `internal/cronx` | Expected interval = shortest gap between fires across all cron entries (robfig/cron, 5-field, UTC) |
+| `internal/cronx` | Expected interval = LONGEST gap in the merged fire sequence of all cron entries, walked day by day over 9 years (robfig/cron parsing, 5-field, UTC, DOW 7 = Sunday, floor 5m) |
 | `internal/collector` | The poll: discovery, workflow-file SHA cache + `on.schedule` parsing, run selection (client-side filtering; shallow ≤5×10 runs, then a deep ≤5×100 search only when no success is known), no-going-backwards merge, metric emission and series deletion |
 | `internal/version` | Build stamping via `-ldflags` |
 
@@ -33,6 +33,10 @@ as a stable API.
 - `last_success` semantics: a value when found (or previously seen), `0` only
   when the run history was exhausted, and *no series* when the search was
   capped with nothing known. Never emit `0` for "didn't look far enough".
+- A scheduled workflow's last success is always `event=schedule` on the
+  default branch; a `branch` override moves only `last_run_*`.
+- Per-workflow series are written under `metrics.mu`; Gather reads under its
+  read lock, so a label swap is atomic to scrapes.
 - A poll with any API error does not advance
   `gh_exporter_last_poll_success_timestamp_seconds` or readiness.
 - Never log the private key or the installation token.

@@ -2,6 +2,7 @@ package collector
 
 import (
 	"slices"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -9,6 +10,10 @@ import (
 )
 
 type metrics struct {
+	// mu guards the per-workflow vecs as a unit: writers take it while
+	// swapping label sets, and Gather takes the read side (see locked).
+	mu sync.RWMutex
+
 	lastRunConclusion *prometheus.GaugeVec
 	lastRunTimestamp  *prometheus.GaugeVec
 	lastRunURL        *prometheus.GaugeVec
@@ -38,10 +43,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			"Always 1; carries the URL of the latest completed run.",
 			"repo", "workflow", "run_url"),
 		lastSuccess: gv("github_workflow_last_success_timestamp_seconds",
-			"Creation time of the last successful run that counts (scheduled workflows: event=schedule only); 0 if none found.",
+			"Creation time of the last successful run that counts (scheduled workflows: event=schedule on the default branch); 0 if the run history holds none; absent if the search was capped.",
 			"repo", "workflow", "branch"),
 		expectedInterval: gv("github_workflow_expected_interval_seconds",
-			"Shortest gap between fires across the workflow's cron schedules.",
+			"Longest gap in seconds between consecutive scheduled fires across all of the workflow's cron entries.",
 			"repo", "workflow"),
 		graceFactor: gv("github_workflow_grace_factor",
 			"Effective grace factor applied to the expected interval.",
@@ -66,9 +71,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Help: "Number of workflows currently watched.",
 		}),
 	}
-	reg.MustRegister(m.lastRunConclusion, m.lastRunTimestamp, m.lastRunURL, m.lastSuccess,
-		m.expectedInterval, m.graceFactor, m.state,
-		m.lastPollSuccess, m.rateLimitRemaining, m.pollErrors, m.watched)
+	for _, v := range m.perWorkflow() {
+		reg.MustRegister(locked{mu: &m.mu, c: v})
+	}
+	reg.MustRegister(m.lastPollSuccess, m.rateLimitRemaining, m.pollErrors, m.watched)
 	for _, k := range github.Kinds {
 		m.pollErrors.WithLabelValues(k)
 	}
@@ -81,7 +87,21 @@ func (m *metrics) perWorkflow() []*prometheus.GaugeVec {
 		m.lastSuccess, m.expectedInterval, m.graceFactor, m.state}
 }
 
-// deleteWorkflow removes every series of one workflow.
+// locked collects a collector under the read side of mu.
+type locked struct {
+	mu *sync.RWMutex
+	c  prometheus.Collector
+}
+
+func (l locked) Describe(ch chan<- *prometheus.Desc) { l.c.Describe(ch) }
+
+func (l locked) Collect(ch chan<- prometheus.Metric) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	l.c.Collect(ch)
+}
+
+// deleteWorkflow removes every series of one workflow. The caller holds mu.
 func (m *metrics) deleteWorkflow(repo, workflow string) {
 	match := prometheus.Labels{"repo": repo, "workflow": workflow}
 	for _, v := range m.perWorkflow() {
@@ -89,7 +109,7 @@ func (m *metrics) deleteWorkflow(repo, workflow string) {
 	}
 }
 
-// swap sets the series for labels to 1 and deletes the previously emitted
+// swap (caller holds mu) sets the series for labels to 1 and deletes the previously emitted
 // label set, so exactly one series exists. It returns labels for the caller
 // to remember.
 func swap(v *prometheus.GaugeVec, prev, labels []string) []string {

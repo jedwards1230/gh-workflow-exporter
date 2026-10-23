@@ -1,6 +1,6 @@
 # gh-workflow-exporter config. Every key is optional.
 
-# How often to poll GitHub. Requests are made one at a time and revalidated
+# How often to poll GitHub (at least 1m). Requests are made one at a time and revalidated
 # with ETags, so a warm poll costs a handful of free 304s.
 poll_interval: 5m
 
@@ -22,5 +22,8 @@ exclude:
 overrides:
   - repo: octo-org/nightly
     workflow: build.yml
-    branch: release      # default: the repo's default branch
+    # Latest-run metrics follow this branch (default: the repo's default
+    # branch). A scheduled workflow's last success is always taken from the
+    # default branch, since GitHub only fires schedules there.
+    branch: release
     grace_factor: 2      # default: default_grace_factor
