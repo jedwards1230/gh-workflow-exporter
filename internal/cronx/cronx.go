@@ -2,15 +2,17 @@
 // workflow from its `on.schedule[].cron` entries.
 //
 // GitHub schedules use the standard 5-field cron syntax evaluated in UTC.
-// The expected interval is the shortest gap between two consecutive fire
-// times across ALL of a workflow's cron entries, which is what a staleness
-// alert needs: whatever the cron's shape, a healthy workflow never goes
-// longer than a small multiple of that without a run.
+// The expected interval is the LONGEST gap between consecutive fires of the
+// merged fire sequence of ALL a workflow's cron entries. That is the longest
+// a healthy workflow can legitimately go without a run, so a staleness alert
+// built on it never fires on a quiet stretch the schedule itself contains
+// (for example a weekdays-only cron over a weekend).
 package cronx
 
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,99 +25,180 @@ import (
 var parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 const (
-	// minGap is the smallest gap a 5-field cron can produce; once found the
-	// simulation can stop early.
-	minGap = time.Minute
 	// window bounds the simulation. Nine years covers every calendar cycle a
-	// 5-field cron can express, including leap days (`0 0 29 2 *`).
+	// 5-field cron can express within its gaps, including leap days
+	// (`0 0 29 2 *` fires every four years).
 	window = 9 * 366 * 24 * time.Hour
-	// maxFires bounds the work for very frequent crons, whose minimum gap
-	// shows up within the first few thousand fires.
-	maxFires = 50000
+	// MinInterval is GitHub's shortest supported schedule interval; more
+	// frequent crons are throttled to it, so the result is clamped up to it.
+	MinInterval = 5 * time.Minute
+	// starBit marks a field written as `*` (or `?`) in robfig's SpecSchedule.
+	starBit       = 1 << 63
+	minutesPerDay = 24 * 60
 )
 
-// epoch is a fixed simulation start so the result is deterministic and does
-// not drift between polls.
+// epoch is a fixed simulation start so the result is deterministic.
 var epoch = time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 // Parse parses a single GitHub cron expression. Runs of whitespace between
-// fields are tolerated.
-func Parse(expr string) (cron.Schedule, error) {
-	norm := strings.Join(strings.Fields(expr), " ")
-	if norm == "" {
+// fields are tolerated, and day-of-week 7 is accepted as Sunday (as GitHub
+// and most crons do; robfig/cron only knows 0-6).
+func Parse(expr string) (*cron.SpecSchedule, error) {
+	fields := strings.Fields(expr)
+	if len(fields) == 0 {
 		return nil, errors.New("empty cron expression")
 	}
-	s, err := parser.Parse(norm)
+	if len(fields) == 5 {
+		dow, err := normalizeDOW(fields[4])
+		if err != nil {
+			return nil, fmt.Errorf("parsing cron %q: %w", expr, err)
+		}
+		fields[4] = dow
+	}
+	s, err := parser.Parse(strings.Join(fields, " "))
 	if err != nil {
 		return nil, fmt.Errorf("parsing cron %q: %w", expr, err)
 	}
-	return s, nil
+	spec, ok := s.(*cron.SpecSchedule)
+	if !ok {
+		return nil, fmt.Errorf("parsing cron %q: unexpected schedule type %T", expr, s)
+	}
+	return spec, nil
 }
 
-// Interval returns the shortest gap between consecutive fire times across all
-// of exprs, evaluated in UTC. It returns an error if any expression is
-// invalid, or if the expressions together fire fewer than twice in the
-// simulation window (so no gap exists).
+// normalizeDOW rewrites day-of-week 7 to 0. Any list element that mentions
+// 7 as a number (`7`, `5-7`, `1-7/2`) is expanded to explicit values; other
+// elements (names, `*`, `*/2`, ranges below 7) pass through unchanged.
+func normalizeDOW(field string) (string, error) {
+	parts := strings.Split(field, ",")
+	for i, p := range parts {
+		rng, stepStr, hasStep := strings.Cut(p, "/")
+		lo, hi, isRange := strings.Cut(rng, "-")
+		if !isRange {
+			hi = lo
+		}
+		if lo != "7" && hi != "7" {
+			continue
+		}
+		a, errA := strconv.Atoi(lo)
+		b, errB := strconv.Atoi(hi)
+		if errA != nil || errB != nil {
+			continue // leave it for the parser to reject
+		}
+		if hasStep && !isRange {
+			b = 7 // "N/step" means N through the max
+		}
+		step := 1
+		if hasStep {
+			n, err := strconv.Atoi(stepStr)
+			if err != nil || n < 1 {
+				return "", fmt.Errorf("invalid day-of-week step in %q", p)
+			}
+			step = n
+		}
+		if a > b || b > 7 {
+			return "", fmt.Errorf("invalid day-of-week range %q", p)
+		}
+		var vals []string
+		for d := a; d <= b; d += step {
+			vals = append(vals, strconv.Itoa(d%7))
+		}
+		parts[i] = strings.Join(vals, ",")
+	}
+	return strings.Join(parts, ","), nil
+}
+
+// Interval returns the longest gap between consecutive fires of the merged
+// fire sequence of exprs, evaluated in UTC over a nine-year window, clamped
+// to at least MinInterval. It errors if any expression is invalid or the
+// expressions together fire fewer than twice in the window.
+//
+// Day matching follows robfig/cron (and Vixie cron): when both day-of-month
+// and day-of-week are restricted the day matches if EITHER does; if either
+// is `*` both must. A stepped wildcard such as `*/2` counts as restricted.
 func Interval(exprs []string) (time.Duration, error) {
 	if len(exprs) == 0 {
 		return 0, errors.New("no cron expressions")
 	}
-	scheds := make([]cron.Schedule, 0, len(exprs))
+	type entry struct {
+		spec *cron.SpecSchedule
+		// minutes of the day the cron fires on a matching day, ascending.
+		minutes []int
+	}
+	entries := make([]entry, 0, len(exprs))
 	for _, e := range exprs {
 		s, err := Parse(e)
 		if err != nil {
 			return 0, err
 		}
-		scheds = append(scheds, s)
-	}
-
-	end := epoch.Add(window)
-	// next[i] is the upcoming fire time of schedule i (zero = never fires).
-	next := make([]time.Time, len(scheds))
-	for i, s := range scheds {
-		next[i] = s.Next(epoch.Add(-time.Second))
-	}
-
-	var (
-		best  time.Duration
-		prev  time.Time
-		fires int
-	)
-	for fires < maxFires {
-		// k-way merge: take the earliest pending fire.
-		idx := -1
-		for i, t := range next {
-			if t.IsZero() || t.After(end) {
+		var mins []int
+		for h := range 24 {
+			if s.Hour&(1<<uint(h)) == 0 {
 				continue
 			}
-			if idx == -1 || t.Before(next[idx]) {
-				idx = i
-			}
-		}
-		if idx == -1 {
-			break
-		}
-		t := next[idx]
-		// Advance every schedule sitting on this instant so identical fires
-		// from different entries collapse into one.
-		for i := range next {
-			if next[i].Equal(t) {
-				next[i] = scheds[i].Next(t)
-			}
-		}
-		if !prev.IsZero() {
-			if gap := t.Sub(prev); best == 0 || gap < best {
-				best = gap
-				if best <= minGap {
-					break
+			for m := range 60 {
+				if s.Minute&(1<<uint(m)) != 0 {
+					mins = append(mins, h*60+m)
 				}
 			}
 		}
-		prev = t
-		fires++
+		entries = append(entries, entry{spec: s, minutes: mins})
 	}
-	if best == 0 {
+
+	// Every cron fires at the same minutes on each day it matches, so the
+	// merged sequence is walked a day at a time: exact over the window and
+	// cheap (days × minutes) even for every-minute crons.
+	var (
+		fireAt  [minutesPerDay]bool
+		longest time.Duration
+		prev    time.Time
+		fires   int
+	)
+	days := int(window / (24 * time.Hour))
+	for d := range days {
+		day := epoch.AddDate(0, 0, d)
+		clear(fireAt[:])
+		matched := false
+		for _, e := range entries {
+			if dayMatches(e.spec, day) {
+				for _, m := range e.minutes {
+					fireAt[m] = true
+				}
+				matched = true
+			}
+		}
+		if !matched {
+			continue
+		}
+		for m, on := range fireAt {
+			if !on {
+				continue
+			}
+			t := day.Add(time.Duration(m) * time.Minute)
+			if fires > 0 {
+				if gap := t.Sub(prev); gap > longest {
+					longest = gap
+				}
+			}
+			prev = t
+			fires++
+		}
+	}
+	if fires < 2 {
 		return 0, fmt.Errorf("cron %q fires fewer than twice in the simulation window", strings.Join(exprs, "; "))
 	}
-	return best, nil
+	return max(longest, MinInterval), nil
+}
+
+// dayMatches mirrors robfig/cron's day matching (month, then DOM/DOW).
+func dayMatches(s *cron.SpecSchedule, t time.Time) bool {
+	if s.Month&(1<<uint(t.Month())) == 0 {
+		return false
+	}
+	dom := s.Dom&(1<<uint(t.Day())) != 0
+	dow := s.Dow&(1<<uint(t.Weekday())) != 0
+	if s.Dom&starBit != 0 || s.Dow&starBit != 0 {
+		return dom && dow
+	}
+	return dom || dow
 }
