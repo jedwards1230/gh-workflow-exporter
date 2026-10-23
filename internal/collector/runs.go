@@ -84,9 +84,12 @@ func (s *selector) add(runs []run) {
 	}
 }
 
-// done reports whether paging can stop: a qualifying success also implies a
-// latest completed run.
-func (s *selector) done() bool { return s.success != nil }
+// done reports whether paging can stop. A qualifying success implies a latest
+// run only when both are taken from the same branch; with a branch override
+// the latest run on the override branch may still lie further back.
+func (s *selector) done() bool {
+	return s.success != nil && (s.latest != nil || s.runBranch == s.successBranch)
+}
 
 // observation is what the exporter remembers per workflow between polls.
 type observation struct {
@@ -110,6 +113,8 @@ func (o *observation) covers(s *selector, page []run) bool {
 	if oldest.After(o.lastSuccess) {
 		return false
 	}
+	// The latest run must be in hand (on its own branch, which may differ
+	// from the success branch) or provably newer than everything older.
 	return s.latest != nil || (o.lastRun != nil && !oldest.After(o.lastRun.CreatedAt))
 }
 

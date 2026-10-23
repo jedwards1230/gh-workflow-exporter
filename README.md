@@ -21,9 +21,10 @@ Every `poll_interval` (default 5m), one request at a time:
    fetched and its `on.schedule[].cron` entries parsed only when its blob SHA
    changes; the result is cached by SHA.
 4. For every watched workflow, `GET .../actions/workflows/{id}/runs?per_page=10`,
-   paging back (up to 5 pages) only when the first page holds no qualifying
-   success. If those 50 runs hold none and no success is known yet, a deep
-   search pages `?per_page=100` (up to 5 pages, 500 runs).
+   paging back (up to 5 pages) only while no qualifying success has been
+   found and the known last success has not been reached. If those 50 runs
+   run out first, a deep search pages `?per_page=100` the same way (up to 5
+   pages, 500 runs).
 
 Every GET is revalidated with `If-None-Match`, so a warm poll is almost
 entirely `304 Not Modified` responses, which GitHub does not count against the
@@ -49,10 +50,11 @@ an override sets `branch`.
   schedule. For include-list workflows, the newest `success` of any event on
   the tracked branch.
 - If the history runs out without a qualifying success, the last success is
-  `0` (never succeeded). If the 50-run search hits its cap first, a
-  previously seen success is kept. With none known (for example right after
-  a restart, since state is in memory), a deep search covers the newest 500
-  runs. If even that is capped, the last success is *unknown*: no
+  `0` (never succeeded). If the 50-run search hits its cap first (for
+  example right after a restart, since state is in memory, or when more than
+  50 other runs landed since the last poll), a deep search covers the newest
+  500 runs. A previously seen success is always kept. If the deep search is
+  capped too and no success is known, the last success is *unknown*: no
   `last_success` series is exported for the workflow (a warning is logged
   once, and no error is counted), rather than a `0` that would read as
   "never succeeded".
@@ -172,9 +174,12 @@ evaluated stays watched (state, latest run, last scheduled success) but has no
 interval or grace series. Day-of-week `7` is accepted as Sunday, and YAML
 anchors, aliases and `<<` merge keys are resolved.
 
-If the Actions API lists files under `.github/workflows` but the directory
-itself is "not found", the App most likely lacks **Contents: read**. A warning
-is logged once per repo and its workflows are treated as unscheduled.
+If the Actions API lists active workflows under `.github/workflows` but the
+directory itself is "not found", the App most likely lacks **Contents:
+read**. That is treated as an error (`kind="404"`, the poll is not
+successful, and the repo's workflows keep their previous series), with a
+warning logged once per repo. Only when no active workflow points into the
+directory does a 404 mean "no workflow files".
 
 ## Example alerts
 

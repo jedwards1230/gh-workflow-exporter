@@ -63,6 +63,8 @@ func Parse(expr string) (*cron.SpecSchedule, error) {
 	if !ok {
 		return nil, fmt.Errorf("parsing cron %q: unexpected schedule type %T", expr, s)
 	}
+	// robfig defaults to time.Local; GitHub evaluates schedules in UTC.
+	spec.Location = time.UTC
 	return spec, nil
 }
 

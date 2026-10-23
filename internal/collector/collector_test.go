@@ -635,8 +635,10 @@ func TestRunPagingKeepsKnownSuccess(t *testing.T) {
 	if got := h.series(t)[lastSuccessKey]; got != known {
 		t.Errorf("last_success = %v, want kept %v", got, known)
 	}
-	if gh.runPageFetch["1/10"] != 5 || gh.runPageFetch["1/100"] != 0 {
-		t.Errorf("pages = %v, want 5 shallow and no deep", gh.runPageFetch)
+	// The shallow walk is capped before reaching back to the known success,
+	// so one deep page (100 runs) is walked, which reaches it and stops.
+	if gh.runPageFetch["1/10"] != 5 || gh.runPageFetch["1/100"] != 1 {
+		t.Errorf("pages = %v, want 5 shallow and 1 deep", gh.runPageFetch)
 	}
 
 	// The known success's run disappears (deleted) and the newer runs are
@@ -1077,32 +1079,159 @@ func TestPollDeadlineCountsAsNetwork(t *testing.T) {
 
 func TestMissingContentsPermissionWarnsOnce(t *testing.T) {
 	gh := standardFixture(t, time.Now())
-	delete(gh.files, nightly) // the dir 404s while workflows still list files
 	h := newHarness(t, gh, standardConfig)
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := h.series(t)
+
+	// The directory starts to 404 while active workflows still point into
+	// it (the App lost Contents: read): an error, not an empty directory.
+	// The poll fails, the workflows keep their series, and the warning is
+	// logged once however often it recurs.
+	gh.mu.Lock()
+	saved := gh.files[nightly]
+	delete(gh.files, nightly)
+	gh.mu.Unlock()
 	for range 2 {
-		if err := h.c.Poll(context.Background()); err != nil {
-			t.Fatalf("Poll: %v", err)
+		if err := h.c.Poll(ctx); err == nil {
+			t.Fatal("poll succeeded with the workflow directory hidden")
+		}
+		if got := h.series(t); !mapsEqual(before, got, "gh_exporter_") {
+			t.Fatalf("series changed while the directory was hidden")
 		}
 	}
 	if n := strings.Count(h.logs.String(), "Contents: read"); n != 1 {
 		t.Errorf("permission warning logged %d times, want 1", n)
 	}
+	if got := h.series(t)[`gh_exporter_poll_errors_total{kind=404}`]; got != 2 {
+		t.Errorf("404 errors = %v, want 2", got)
+	}
 
 	// Readable again, then hidden again: the warning fires anew.
 	gh.mu.Lock()
-	gh.files[nightly] = map[string]string{".github/workflows/build.yml": dailyYAML}
+	gh.files[nightly] = saved
 	gh.mu.Unlock()
-	if err := h.c.Poll(context.Background()); err != nil {
+	if err := h.c.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
 	gh.mu.Lock()
 	delete(gh.files, nightly)
 	gh.mu.Unlock()
+	_ = h.c.Poll(ctx)
+	if n := strings.Count(h.logs.String(), "Contents: read"); n != 2 {
+		t.Errorf("permission warning logged %d times after a recovery, want 2", n)
+	}
+}
+
+// TestMissingDirWithOnlyInactiveWorkflows: when no active workflow points
+// into the directory, a 404 is a genuinely empty directory, not an error.
+func TestMissingDirWithOnlyInactiveWorkflows(t *testing.T) {
+	gh := standardFixture(t, time.Now())
+	for i := range gh.workflows[nightly] {
+		gh.workflows[nightly][i].State = "disabled_manually"
+	}
+	delete(gh.files, nightly)
+	h := newHarness(t, gh, "")
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got := h.series(t)[`gh_exporter_watched_workflows{}`]; got != 0 {
+		t.Errorf("watched = %v, want 0", got)
+	}
+}
+
+func TestBuriedNewerSuccessFoundByDeepWalk(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := pagingFixture(t, now, 30, 3)
+	h := newHarness(t, gh, "")
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Between polls: a new scheduled success, then more than 50
+	// non-qualifying runs on top of it.
+	gh.mu.Lock()
+	fresh := ghRun(nightly, 300000, now.Add(time.Hour), "schedule", "success")
+	var top []run
+	for i := range 70 {
+		top = append(top, ghRun(nightly, int64(400000-i), now.Add(3*time.Hour-time.Duration(i)*time.Minute), "push", "success"))
+	}
+	gh.runs[1] = append(append(top, fresh), gh.runs[1]...)
+	gh.runPageFetch = map[string]int{}
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.series(t)[lastSuccessKey]; got != float64(fresh.CreatedAt.Unix()) {
+		t.Errorf("last_success = %v, want the buried newer success %v", got, fresh.CreatedAt.Unix())
+	}
+	if gh.runPageFetch["1/10"] != 5 || gh.runPageFetch["1/100"] != 1 {
+		t.Errorf("pages = %v, want 5 shallow and 1 deep", gh.runPageFetch)
+	}
+}
+
+// TestBranchRepointKeepsSeriesUntilListingSucceeds: the old branch's series
+// are only replaced once the new branch's runs have been listed.
+func TestBranchRepointKeepsSeriesUntilListingSucceeds(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := standardFixture(t, now)
+	h := newHarness(t, gh, standardConfig)
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	oldKey := `github_workflow_last_run_conclusion{branch=main,conclusion=cancelled,event=schedule,repo=octo-org/nightly,workflow=build.yml}`
+
+	gh.mu.Lock()
+	gh.fail["/repos/octo-org/nightly/actions/workflows/1/runs"] = http.StatusBadGateway
+	gh.mu.Unlock()
+	h.c.cfg = mustConfig(t, standardConfig+"overrides:\n  - repo: octo-org/nightly\n    workflow: build.yml\n    branch: release\n")
+	if err := h.c.Poll(ctx); err == nil {
+		t.Fatal("want error")
+	}
+	if _, ok := h.series(t)[oldKey]; !ok {
+		t.Fatal("old-branch series deleted before the new listing succeeded")
+	}
+
+	gh.mu.Lock()
+	delete(gh.fail, "/repos/octo-org/nightly/actions/workflows/1/runs")
+	rel := ghRun(nightly, 109, now.Add(-time.Minute), "push", "failure")
+	rel.HeadBranch = "release"
+	gh.runs[1] = append([]run{rel}, gh.runs[1]...)
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := h.series(t)
+	if _, ok := got[oldKey]; ok {
+		t.Error("old-branch series survived a successful re-point")
+	}
+	assertSeries(t, got, map[string]float64{
+		`github_workflow_last_run_conclusion{branch=release,conclusion=failure,event=push,repo=octo-org/nightly,workflow=build.yml}`: 1,
+	})
+}
+
+// TestOverrideBranchRunsBeyondFirstPage: a default-branch scheduled success
+// on page 1 must not stop paging before the override branch's latest run.
+func TestOverrideBranchRunsBeyondFirstPage(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := pagingFixture(t, now, 30, 0) // scheduled success is the newest run
+	rel := ghRun(nightly, 1, now.Add(-15*time.Hour-30*time.Minute), "push", "failure")
+	rel.HeadBranch = "release"
+	gh.runs[1] = append(gh.runs[1][:15], append([]run{rel}, gh.runs[1][15:]...)...) // index 15: page 2
+	h := newHarness(t, gh, "overrides:\n  - repo: octo-org/nightly\n    workflow: build.yml\n    branch: release\n")
 	if err := h.c.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if n := strings.Count(h.logs.String(), "Contents: read"); n != 2 {
-		t.Errorf("permission warning logged %d times after a recovery, want 2", n)
+	got := h.series(t)
+	assertSeries(t, got, map[string]float64{
+		`github_workflow_last_run_conclusion{branch=release,conclusion=failure,event=push,repo=octo-org/nightly,workflow=build.yml}`: 1,
+		lastSuccessKey: float64(now.Add(-time.Hour).Unix()),
+	})
+	if gh.runPageFetch["1/10"] != 2 {
+		t.Errorf("shallow pages = %d, want 2", gh.runPageFetch["1/10"])
 	}
 }
 

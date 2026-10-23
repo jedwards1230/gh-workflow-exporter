@@ -87,6 +87,10 @@ type workflowState struct {
 	conclusion []string
 	runURL     []string
 	state      []string
+
+	// replaces lists the (repo, workflow) label pairs of a state this one
+	// superseded; their series are deleted on this state's first emit.
+	replaces [][2]string
 }
 
 // New returns a Collector that registers its metrics on reg.
@@ -345,13 +349,14 @@ func (c *Collector) pollRepo(p *poll, r repository) {
 		st := c.watched[key]
 		if st == nil || st.repo != r.FullName || st.workflow != name || st.branch != branch || st.successBranch != successBranch {
 			// New, renamed, or re-pointed at another branch: earlier
-			// observations no longer describe this series.
+			// observations no longer describe this series. The old series
+			// are only replaced once the new runs listing has succeeded
+			// (in emit), so a failure here keeps them visible.
+			next := &workflowState{repo: r.FullName, workflow: name, branch: branch, successBranch: successBranch}
 			if st != nil {
-				c.m.mu.Lock()
-				c.m.deleteWorkflow(st.repo, st.workflow)
-				c.m.mu.Unlock()
+				next.replaces = append(st.replaces, [2]string{st.repo, st.workflow})
 			}
-			st = &workflowState{repo: r.FullName, workflow: name, branch: branch, successBranch: successBranch}
+			st = next
 			c.watched[key] = st
 		}
 		p.seen[key] = true
@@ -409,17 +414,24 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 	u := repoPath(r.FullName) + "/contents/" + workflowDir + "?ref=" + url.QueryEscape(r.DefaultBranch)
 	res, err := c.api.Get(p.ctx, u)
 	if err != nil {
+		if github.IsNotFound(err) && !hasActiveFileWorkflow(workflows) {
+			// Only inactive workflows point into the directory, so it may
+			// really be gone from the default branch: nothing is scheduled.
+			c.files[key] = map[string]string{}
+			return c.files[key]
+		}
 		if github.IsNotFound(err) {
-			// The Actions API lists files under .github/workflows, yet the
-			// directory is "not found": either it exists only on another
-			// branch, or (far more often) the App lacks Contents: read and
-			// GitHub hides the directory. Either way nothing is scheduled.
+			// Active workflows live under .github/workflows, yet the
+			// directory is "not found": almost always the App lacks
+			// Contents: read and GitHub hides it. That is an error, not an
+			// empty directory: keep the previous file set so the workflows
+			// keep their series, and fail the poll.
 			if !c.warnedNoContents[key] {
 				c.warnedNoContents[key] = true
 				c.log.Warn("workflow directory not readable on the default branch; does the App have Contents: read?",
 					"repo", r.FullName, "branch", r.DefaultBranch)
 			}
-			c.files[key] = map[string]string{}
+			c.fail(p, err, "listing workflow files", "repo", r.FullName)
 			return c.files[key]
 		}
 		delete(c.warnedNoContents, key)
@@ -444,6 +456,17 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 	}
 	c.files[key] = files
 	return files
+}
+
+// hasActiveFileWorkflow reports whether an active workflow is defined by a
+// file under workflowDir.
+func hasActiveFileWorkflow(workflows []workflow) bool {
+	for _, wf := range workflows {
+		if wf.State == "active" && strings.HasPrefix(wf.Path, workflowDir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // scheduleFor returns the workflow's parsed schedule (nil when it has none)
@@ -532,13 +555,12 @@ func escapePath(p string) string {
 // the workflow's last success is known.
 //
 // The shallow listing (per_page=10, at most maxRunPages pages) is enough
-// almost always. When it hits its cap without a qualifying success:
-//   - a previously observed success is kept (no going backwards) and nothing
-//     more is fetched;
-//   - otherwise a deep listing (per_page=100, at most maxRunPages pages) is
-//     searched. A workflow that also runs on push, PRs or Dependabot can
-//     bury its last scheduled success under more than 50 other runs, and
-//     state is in memory, so this happens after every restart.
+// almost always. When it hits its cap without finding a qualifying success
+// or reaching back past the known one, a deep listing (per_page=100, at most
+// maxRunPages pages) is searched the same way. A workflow that also runs on
+// push, PRs or Dependabot can bury a scheduled success under more than 50
+// other runs: after a restart (state is in memory) or between two polls.
+// merge stays monotone either way, so a known success is never lost.
 //
 // If even the deep listing is capped, the last success is unknown: no series
 // is emitted for it (an "absent" is honest; a 0 would page as "never
@@ -549,7 +571,7 @@ func (c *Collector) collectRuns(ctx context.Context, st *workflowState, workflow
 	if err != nil {
 		return err
 	}
-	if capped && st.obs.lastSuccess.IsZero() {
+	if capped {
 		if capped, err = c.fetchRuns(ctx, base+"?per_page=100", st.repo, sel, &st.obs); err != nil {
 			return err
 		}
@@ -601,6 +623,10 @@ func (c *Collector) emit(st *workflowState, state string, scheduled bool, sched 
 	// the new label set of a swapped series.
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, old := range st.replaces {
+		m.deleteWorkflow(old[0], old[1])
+	}
+	st.replaces = nil
 	if r := st.obs.lastRun; r != nil {
 		conclusion := r.Conclusion
 		if conclusion == "" {
@@ -643,6 +669,9 @@ func (c *Collector) dropUnseen(p *poll) {
 			continue
 		}
 		c.m.deleteWorkflow(st.repo, st.workflow)
+		for _, old := range st.replaces {
+			c.m.deleteWorkflow(old[0], old[1])
+		}
 		delete(c.watched, k)
 		c.log.Info("workflow no longer watched", "repo", st.repo, "workflow", st.workflow)
 	}

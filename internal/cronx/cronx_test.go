@@ -77,14 +77,23 @@ func TestInterval(t *testing.T) {
 
 // TestDayMatchingAgreesWithRobfig cross-checks the day-at-a-time walk against
 // robfig's own Next() for a few shapes over the first year.
+//
+// The late-evening crons land on another UTC day if a schedule is evaluated
+// in any zone but UTC, which the EST-zoned input below would expose.
 func TestDayMatchingAgreesWithRobfig(t *testing.T) {
-	for _, expr := range []string{"0 0 1 * 1", "0 0 */10 * 1", "0 9 * * 1-5", "15 3 1,15 * *", "0 0 * 2 *"} {
+	for _, expr := range []string{"0 0 1 * 1", "0 0 */10 * 1", "0 9 * * 1-5", "15 3 1,15 * *", "0 0 * 2 *", "30 23 * * 1", "45 23 28 * *"} {
 		s, err := Parse(expr)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if s.Location != time.UTC {
+			t.Fatalf("%s: location %v, want UTC", expr, s.Location)
+		}
 		var sched cron.Schedule = s
-		next := sched.Next(epoch.Add(-time.Second))
+		// Feed robfig a non-UTC time: a schedule left at time.Local would be
+		// evaluated in the zone of the time passed in.
+		est := time.FixedZone("EST", -5*3600)
+		next := sched.Next(epoch.Add(-time.Second).In(est))
 		for d := range 366 {
 			day := epoch.AddDate(0, 0, d)
 			want := !next.IsZero() && next.Before(day.Add(24*time.Hour)) && !next.Before(day)
