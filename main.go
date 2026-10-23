@@ -147,7 +147,13 @@ func run(args []string, getenv func(string) string) error {
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", o.listen, err)
 	}
-	srv := &http.Server{Handler: newMux(reg, col.Ready), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Handler:           newMux(reg, col.Ready),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	log.Info("starting", "version", version.Info(), "listen", ln.Addr().String(),
 		"poll_interval", cfg.Interval().String(), "app_id", creds.AppID, "installation_id", creds.InstallationID)

@@ -86,7 +86,8 @@ func TestParseInvalid(t *testing.T) {
 	tests := []struct {
 		name, doc, wantErr string
 	}{
-		{"negative interval", "poll_interval: -1m", "poll_interval must be positive"},
+		{"negative interval", "poll_interval: -1m", "poll_interval must be at least 1m"},
+		{"interval below minimum", "poll_interval: 30s", "poll_interval must be at least 1m"},
 		{"bad duration", "poll_interval: soon", "duration"},
 		{"negative grace", "default_grace_factor: -1", "default_grace_factor must be positive"},
 		{"unknown key", "poll_intervall: 5m", "not found"},

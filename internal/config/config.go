@@ -18,6 +18,8 @@ import (
 const (
 	DefaultPollInterval = 5 * time.Minute
 	DefaultGraceFactor  = 1.5
+	// MinPollInterval keeps a misconfiguration from hammering the API.
+	MinPollInterval = time.Minute
 )
 
 // Duration is a time.Duration that unmarshals from a Go duration string
@@ -132,8 +134,8 @@ func Parse(r io.Reader) (*Config, error) {
 // finish validates the config and builds the lookup maps.
 func (c *Config) finish() error {
 	var errs []error
-	if c.PollInterval <= 0 {
-		errs = append(errs, fmt.Errorf("poll_interval must be positive, got %s", time.Duration(c.PollInterval)))
+	if time.Duration(c.PollInterval) < MinPollInterval {
+		errs = append(errs, fmt.Errorf("poll_interval must be at least %s, got %s", MinPollInterval, time.Duration(c.PollInterval)))
 	}
 	if c.DefaultGraceFactor <= 0 {
 		errs = append(errs, fmt.Errorf("default_grace_factor must be positive, got %v", c.DefaultGraceFactor))
