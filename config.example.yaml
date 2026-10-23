@@ -1,0 +1,26 @@
+# gh-workflow-exporter config. Every key is optional.
+
+# How often to poll GitHub. Requests are made one at a time and revalidated
+# with ETags, so a warm poll costs a handful of free 304s.
+poll_interval: 5m
+
+# Multiplier on a workflow's expected cron interval before it counts as
+# stale (see the Stale alert in README.md).
+default_grace_factor: 1.5
+
+# Workflows without a schedule to watch anyway, for failure tracking only.
+include:
+  - repo: octo-org/infra
+    workflow: deploy.yml
+
+# Scheduled workflows to ignore.
+exclude:
+  - repo: octo-org/tools
+    workflow: codeql.yml
+
+# Per-workflow tweaks.
+overrides:
+  - repo: octo-org/nightly
+    workflow: build.yml
+    branch: release      # default: the repo's default branch
+    grace_factor: 2      # default: default_grace_factor

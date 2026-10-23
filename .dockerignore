@@ -1,0 +1,10 @@
+.git
+worktrees/
+.github
+.claude
+gh-workflow-exporter
+dist/
+bin/
+coverage.*
+*.pem
+config.yaml
