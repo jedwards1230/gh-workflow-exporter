@@ -1,0 +1,365 @@
+# Single-file release pipeline (modeled on jedwards1230/scrim's release.yml).
+#
+# Triggered on push to main (or manual dispatch). A `detect` job decides whether
+# the merged PR warrants a release:
+#   1. An explicit semver:major|minor|patch label always wins (that bump);
+#      semver:none always means no release -- even if the diff is dev-only.
+#   2. No label: the PR's changed files decide. If EVERY changed file is
+#      dev-only (CI, tests, linter config, docs, agent instructions -- see
+#      .github/.releaseignore, gitignore syntax) there is no release; otherwise
+#      patch.
+#   3. No usable file classification (no associated PR / direct push, the
+#      changed-files lookup fails or is empty, or the matcher errors): release
+#      as patch with a ::warning:: -- a missed release is invisible, an extra
+#      one is harmless. (semver:none still wins whenever labels were read.)
+#   4. workflow_dispatch always releases.
+# When a release is warranted it delegates version compute, tag creation, and
+# AI release notes to the shared
+# jedwards1230/release-workflows/.github/workflows/ai-release.yml@v1, then
+# builds and pushes a multi-arch (linux/amd64, linux/arm64) container image to
+# GHCR and publishes the GitHub Release. The image is the only release
+# artifact.
+#
+# The git tag is the single source of truth: the image job checks out the
+# TAGGED commit and stamps the computed version into the binary via Docker
+# build-args — no file edit, nothing pushed back to main. The GitHub Release is
+# published only after the image push succeeds, so a Release never points at a
+# missing image.
+name: Release
+
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch'
+      && format('Release: {0}{1}', inputs.dry_run && 'dry-run ' || '', inputs.bump_type)
+      || format('Release: {0}', github.event.head_commit.message || github.sha)
+  }}
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      dry_run:
+        description: "Compute version + preview notes without tagging or publishing"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # ai-release.yml@v1 reads merged PRs for the changelog and the detect job runs
+  # `gh pr list` — both need pull-requests:read. A restricted permissions block
+  # defaults every unlisted scope to none, so grant it explicitly.
+  pull-requests: read
+
+jobs:
+  detect:
+    name: Detect bump type
+    runs-on: ubuntu-latest
+    outputs:
+      bump_type: ${{ steps.bump.outputs.type }}
+      dry_run: ${{ steps.bump.outputs.dry_run }}
+      release: ${{ steps.bump.outputs.release }}
+    steps:
+      # Only the dev-only path list is needed; sparse so detect stays cheap.
+      - name: Checkout release ignore list
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/.releaseignore
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Determine bump type
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TYPE="${{ inputs.bump_type }}"
+            DRY="${{ inputs.dry_run }}"
+            RELEASE="true"
+          else
+            # Look up the PR associated with this exact commit directly (a
+            # targeted commit->PR lookup, not a list+client-side-filter), so the
+            # merged PR can never fall outside a paginated window. The PR may not
+            # be indexed yet right after the push, so retry only while it is
+            # still missing; labels are read from the same response.
+            PR_NUMBER=""
+            LABELS=""
+            for attempt in 1 2 3; do
+              # One call yields both the PR number and its labels, so a failed
+              # second lookup can never leave a found PR looking label-less
+              # (which would let an explicit semver:none fall through to the
+              # files rule). Output: first line = number, rest = label names.
+              # shellcheck disable=SC2016 # $ENV.GITHUB_SHA is jq's own env-var
+              # syntax, not a bash variable -- must stay single-quoted so bash
+              # doesn't expand it before jq sees it.
+              PR_INFO=$(gh api "repos/${GH_REPO}/commits/${GITHUB_SHA}/pulls" \
+                --jq '[.[] | select(.merge_commit_sha == $ENV.GITHUB_SHA)] | first | select(. != null) | (.number | tostring), (.labels[].name)' 2>/dev/null || echo "")
+              if [ -n "$PR_INFO" ]; then
+                PR_NUMBER=$(printf '%s\n' "$PR_INFO" | head -n 1)
+                LABELS=$(printf '%s\n' "$PR_INFO" | tail -n +2)
+                break
+              fi
+              echo "Attempt ${attempt}: no PR for ${GITHUB_SHA} yet, retrying in 5s..."
+              sleep 5
+            done
+            echo "PR for ${GITHUB_SHA}: ${PR_NUMBER:-<none>}; labels: ${LABELS:-<none>}"
+            DRY="false"
+            if [ -z "$PR_NUMBER" ]; then
+              TYPE="patch"; RELEASE="true"
+              echo "::warning::no merged PR found for ${GITHUB_SHA} (direct push, or the lookup failed) — cannot classify the diff, releasing as patch."
+            elif echo "$LABELS" | grep -qx 'semver:major'; then
+              TYPE="major"; RELEASE="true"
+            elif echo "$LABELS" | grep -qx 'semver:minor'; then
+              TYPE="minor"; RELEASE="true"
+            elif echo "$LABELS" | grep -qx 'semver:patch'; then
+              TYPE="patch"; RELEASE="true"
+            elif echo "$LABELS" | grep -qx 'semver:none'; then
+              # An explicit "no release" is a different fact from a missing
+              # label, even though both skip. Distinguishing them means a
+              # skipped run's log says whether that was intended.
+              TYPE="none"; RELEASE="false"
+              echo "::notice::semver:none on PR #${PR_NUMBER} — no release, as declared"
+            elif ! FILES=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --paginate \
+                --jq '.[] | .filename, (.previous_filename // empty)' 2>/dev/null) || [ -z "$FILES" ]; then
+              TYPE="patch"; RELEASE="true"
+              echo "::warning::no semver:* label on PR #${PR_NUMBER} and its changed files could not be listed (or the list is empty) — cannot classify the diff, releasing as patch."
+            else
+              # No label: the changed files decide (previous_filename is included
+              # above so a rename OUT of a product path still counts as product).
+              # Dev-only paths live in .github/.releaseignore (gitignore syntax),
+              # matched by git's own engine in a throwaway empty repo so no other
+              # ignore source leaks in. Missing/empty file => nothing is dev-only.
+              RELEASEIGNORE="${GITHUB_WORKSPACE}/.github/.releaseignore"
+              mapfile -t FILE_LIST < <(printf '%s\n' "$FILES" | sort -u)
+              MATCHED=()
+              CHECK_RC=0
+              if [ -s "$RELEASEIGNORE" ]; then
+                # Any setup failure counts as a matcher error (CHECK_RC > 1).
+                SCRATCH=$(mktemp -d) || CHECK_RC=99
+                if [ "$CHECK_RC" -le 1 ]; then
+                  git init -q "$SCRATCH" || CHECK_RC=99
+                fi
+                if [ "$CHECK_RC" -le 1 ]; then
+                  printf '%s\0' "${FILE_LIST[@]}" > "${SCRATCH}.paths" || CHECK_RC=99
+                fi
+                if [ "$CHECK_RC" -le 1 ]; then
+                  git -C "$SCRATCH" -c core.excludesFile="$RELEASEIGNORE" \
+                    check-ignore --no-index -z --stdin < "${SCRATCH}.paths" > "${SCRATCH}.matched" || CHECK_RC=$?
+                fi
+                # rc: 0 = some matched, 1 = none matched, anything else = error
+                if [ "$CHECK_RC" -le 1 ]; then
+                  mapfile -d '' MATCHED < "${SCRATCH}.matched" || CHECK_RC=99
+                fi
+              else
+                echo "::notice::.github/.releaseignore is missing or empty -- no path counts as dev-only"
+              fi
+              if [ "$CHECK_RC" -gt 1 ]; then
+                TYPE="patch"; RELEASE="true"
+                echo "::warning::git check-ignore failed (rc=${CHECK_RC}) on PR #${PR_NUMBER} -- cannot classify the diff, releasing as patch."
+              else
+                declare -A IS_DEV=()
+                for f in "${MATCHED[@]}"; do IS_DEV["$f"]=1; done
+                FIRST_PRODUCT=""
+                for f in "${FILE_LIST[@]}"; do
+                  if [ -z "${IS_DEV[$f]+x}" ]; then FIRST_PRODUCT="$f"; break; fi
+                done
+                if [ -n "$FIRST_PRODUCT" ]; then
+                  TYPE="patch"; RELEASE="true"
+                  echo "::notice::no semver:* label on PR #${PR_NUMBER} — releasing as patch; first non-dev-only file: ${FIRST_PRODUCT}"
+                else
+                  TYPE="none"; RELEASE="false"
+                  echo "::notice::dev-only rule fired on PR #${PR_NUMBER} — no release (${#FILE_LIST[@]} changed path(s), all dev-only; first: $(printf '%s\n' "${FILE_LIST[@]}" | head -n 3 | paste -sd, -))"
+                fi
+              fi
+            fi
+          fi
+          # Defensive: make sure a future label-parsing bug can't silently
+          # propagate an unexpected value downstream.
+          case "$TYPE" in
+            major | minor | patch | none) ;;
+            *)
+              echo "::error::invalid bump type computed: $TYPE"
+              exit 1
+              ;;
+          esac
+          {
+            echo "type=$TYPE"
+            echo "dry_run=$DRY"
+            echo "release=$RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Tag & Generate Notes
+    needs: [detect]
+    if: needs.detect.outputs.release == 'true'
+    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@b185a6e7822f9c36822ed8e89e77b3d0fe229f96 # v1.12.0
+    with:
+      service_name: gh-workflow-exporter
+      service_description: "a Prometheus exporter for GitHub Actions workflow health (last run, staleness, disabled state)"
+      bump_type: ${{ needs.detect.outputs.bump_type }}
+      dry_run: ${{ needs.detect.outputs.dry_run == 'true' }}
+      create_release: false
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  image:
+    name: Build & push container image
+    needs: [detect, prepare]
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # Scoped to this job (not the workflow): pushing to GHCR needs
+      # packages:write; contents:read is enough to check out the tagged source.
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Compute build metadata
+        id: buildmeta
+        run: |
+          set -euo pipefail
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/jedwards1230/gh-workflow-exporter
+          # This job runs on push:main, so github.ref is a branch, not the tag —
+          # feed metadata-action the computed release tag explicitly.
+          # Tags: vX.Y.Z (the git tag), X.Y.Z, and latest.
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=raw,value=latest
+          # org.opencontainers.image.source links the GHCR package to the repo
+          # (Packages UI + provenance). Pinned explicitly so the link never
+          # depends on autodetection.
+          labels: |
+            org.opencontainers.image.source=https://github.com/jedwards1230/gh-workflow-exporter
+            org.opencontainers.image.title=gh-workflow-exporter
+            org.opencontainers.image.description=Prometheus exporter for GitHub Actions workflow health
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ steps.buildmeta.outputs.commit }}
+            DATE=${{ steps.buildmeta.outputs.date }}
+          # No provenance/SBOM attestations: they add an extra "unknown/unknown"
+          # manifest entry to the multi-arch index that clutters the GHCR
+          # package listing.
+          provenance: false
+
+      - name: Write workflow summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "## Container image"
+            echo ""
+            echo "Pushed \`ghcr.io/jedwards1230/gh-workflow-exporter\` (linux/amd64, linux/arm64):"
+            echo ""
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Create GitHub Release
+    needs: [detect, prepare, image]
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Compose release body (AI notes + pull snippet)
+        env:
+          BODY_B64: ${{ needs.prepare.outputs.release_body }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # ai-release.yml emits a base64-encoded body to survive Actions' job-output
+          # character restrictions; decode before use.
+          {
+            echo "## Container image"
+            echo ""
+            echo '```sh'
+            echo "docker pull ghcr.io/jedwards1230/gh-workflow-exporter:${TAG}"
+            echo '```'
+            echo ""
+            echo "$BODY_B64" | base64 -d
+          } > "${RUNNER_TEMP}/release_body.md"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body_path: ${{ runner.temp }}/release_body.md
+          make_latest: true
+
+      - name: Write workflow summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREV: ${{ needs.prepare.outputs.prev_tag }}
+          BUMP_TYPE: ${{ needs.prepare.outputs.bump_type }}
+        run: |
+          {
+            echo "## Release ${TAG}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Version | ${VERSION} |"
+            echo "| Tag | ${TAG} |"
+            echo "| Previous | ${PREV} |"
+            echo "| Bump | ${BUMP_TYPE} |"
+            echo "| Image | ghcr.io/jedwards1230/gh-workflow-exporter:${TAG} (linux/amd64, linux/arm64) |"
+          } >> "$GITHUB_STEP_SUMMARY"

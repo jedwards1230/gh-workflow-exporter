@@ -1,0 +1,120 @@
+# Validates the PR's release-intent label: at most one semver:* label.
+#
+# No label is allowed. release.yml then decides from the diff: a PR whose
+# changed files are ALL dev-only (CI, tests, docs, linter config, agent
+# instructions) does not release; anything else releases as patch. An explicit
+# label always wins -- semver:none forces no release, major|minor|patch forces
+# that bump. Two labels would be resolved by priority (major > minor > patch)
+# and could silently turn semver:none into a release, so that stays an error.
+#
+# Also emits a NON-BLOCKING warning when a PR carries semver:major|minor|patch
+# but every changed file is dev-only: the label forces a release the diff alone
+# would not have cut.
+name: Semver label
+
+on:
+  pull_request:
+    # `labeled`/`unlabeled` matter as much as the code events: adding the label
+    # is usually what FIXES a failing run, so the check has to re-evaluate on a
+    # label change or it stays red with nothing to push.
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  # Lists the PR's changed files for the dev-only warning below.
+  pull-requests: read
+
+concurrency:
+  group: semver-label-${{ github.event.pull_request.number }}
+  # Labelling a PR right after opening it supersedes the first (label-less,
+  # certain-to-fail) run. Expect to see that CANCELLED run linger next to the
+  # passing one: GitHub evaluates the most recent run per check name, so merges
+  # are unaffected, but aggregators that count cancelled as failed (ci-watch
+  # among them) will report a phantom failure. `gh pr checks <pr>` shows the
+  # authoritative per-check state.
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Release intent declared
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release ignore list
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/.releaseignore
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate semver:* labels
+        env:
+          # Rendered from the event payload rather than fetched, so the check
+          # reflects the labels that triggered this run. Passed through env to
+          # keep PR-controlled text out of the shell's parse step.
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          echo "Labels on this PR: ${LABELS:-<none>}"
+
+          matched=""
+          for want in major minor patch none; do
+            # Comma-delimit both sides so `semver:none` cannot substring-match
+            # inside some future `semver:none-really` label.
+            case ",${LABELS}," in
+              *",semver:${want},"*) matched="${matched} semver:${want}" ;;
+            esac
+          done
+          matched="${matched# }"
+          count=$(printf '%s' "$matched" | wc -w | tr -d ' ')
+
+          if [ "$count" -gt 1 ]; then
+            echo "::error::conflicting release intent: ${matched}"
+            echo ""
+            echo "This PR carries more than one semver:* label. release.yml resolves"
+            echo "them in priority order (major > minor > patch), so an accidental"
+            echo "extra label would silently outrank the one you meant -- including"
+            echo "overriding semver:none into a real release. Leave at most one."
+            exit 1
+          fi
+
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::no semver:* label -- release.yml will decide from the changed files (all dev-only: no release; otherwise patch)"
+            exit 0
+          fi
+
+          echo "::notice::release intent: ${matched}"
+
+          # Non-blocking: warn when a forcing label sits on a dev-only diff.
+          if [ "$matched" = "semver:none" ]; then exit 0; fi
+          if ! FILES=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files" --paginate \
+              --jq '.[] | .filename, (.previous_filename // empty)' 2>/dev/null) || [ -z "$FILES" ]; then
+            echo "::warning::could not list changed files -- skipped the dev-only check"
+            exit 0
+          fi
+          # Same list and mechanism as release.yml: .github/.releaseignore matched
+          # by git's own engine in a throwaway empty repo. Missing/empty file =>
+          # nothing is dev-only => no warning.
+          RELEASEIGNORE="${GITHUB_WORKSPACE}/.github/.releaseignore"
+          if [ ! -s "$RELEASEIGNORE" ]; then exit 0; fi
+          # This warning is advisory: any setup failure skips it, never fails the job.
+          skip() { echo "::warning::dev-only check skipped: $1"; exit 0; }
+          mapfile -t FILE_LIST < <(printf '%s\n' "$FILES" | sort -u) || skip "could not read file list"
+          SCRATCH=$(mktemp -d) || skip "mktemp failed"
+          git init -q "$SCRATCH" || skip "git init failed"
+          printf '%s\0' "${FILE_LIST[@]}" > "${SCRATCH}.paths" || skip "could not write path list"
+          rc=0
+          git -C "$SCRATCH" -c core.excludesFile="$RELEASEIGNORE" \
+            check-ignore --no-index -z --stdin < "${SCRATCH}.paths" > "${SCRATCH}.matched" || rc=$?
+          if [ "$rc" -gt 1 ]; then skip "git check-ignore failed (rc=${rc})"; fi
+          MATCHED=()
+          if [ "$rc" -eq 0 ]; then
+            mapfile -d '' MATCHED < "${SCRATCH}.matched" || skip "could not read matcher output"
+          fi
+          [ "${#MATCHED[@]}" -eq "${#FILE_LIST[@]}" ] || exit 0
+          msg="this diff is dev-only; semver:none (or no label) would skip the release (${matched} forces one)"
+          echo "::warning::${msg}"
+          echo "**Warning:** ${msg}" >> "$GITHUB_STEP_SUMMARY"
