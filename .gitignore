@@ -1,0 +1,21 @@
+# Binaries
+/gh-workflow-exporter
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local config / secrets
+/config.yaml
+*.pem
+.env
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Worktrees
+worktrees/
