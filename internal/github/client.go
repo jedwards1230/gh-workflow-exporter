@@ -167,7 +167,7 @@ func (c *Client) Get(ctx context.Context, pathOrURL string) (*Response, error) {
 	for attempt := 0; ; attempt++ {
 		res, err := c.getLocked(ctx, u)
 		var e *Error
-		if attempt == 0 && errors.As(err, &e) && e.Status == http.StatusUnauthorized {
+		if attempt == 0 && errors.As(err, &e) && e.Status == http.StatusUnauthorized && !e.mint {
 			c.invalidateTokenLocked()
 			continue
 		}
@@ -215,8 +215,13 @@ func (c *Client) getLocked(ctx context.Context, u string) (*Response, error) {
 	}
 	defer res.Body.Close() //nolint:errcheck // body fully read below
 	c.observeRateLimit(res.Header)
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxBody))
+	body, err := readBody(res.Body)
 	if err != nil {
+		var e *Error
+		if errors.As(err, &e) {
+			e.Op = op
+			return nil, e
+		}
 		return nil, &Error{Kind: KindNetwork, Op: op, Err: err}
 	}
 
@@ -259,6 +264,19 @@ func (c *Client) observeRateLimit(h http.Header) {
 	if n, err := strconv.ParseFloat(v, 64); err == nil {
 		c.onRateLimit(n)
 	}
+}
+
+// readBody reads a whole response body, failing (as KindParse) rather than
+// truncating when it exceeds maxBody, so a cut-off body is never cached.
+func readBody(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxBody {
+		return nil, &Error{Kind: KindParse, Err: fmt.Errorf("response body exceeds %d bytes", maxBody)}
+	}
+	return body, nil
 }
 
 // nextLink extracts the rel="next" URL from an RFC 8288 Link header.

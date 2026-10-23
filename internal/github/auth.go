@@ -12,7 +12,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -100,38 +99,68 @@ func (c *Client) invalidateTokenLocked() {
 func (c *Client) mintLocked(ctx context.Context, now time.Time) (string, time.Time, error) {
 	jwt, err := c.appJWT(now)
 	if err != nil {
-		return "", time.Time{}, &Error{Kind: KindAuth, Op: "minting installation token", Err: err}
+		return "", time.Time{}, &Error{Kind: KindAuth, Op: "minting installation token", Err: err, mint: true}
 	}
 	u := c.base.JoinPath("app", "installations", strconv.FormatInt(c.installationID, 10), "access_tokens")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
 	if err != nil {
-		return "", time.Time{}, &Error{Kind: KindAuth, Op: "minting installation token", Err: err}
+		return "", time.Time{}, &Error{Kind: KindAuth, Op: "minting installation token", Err: err, mint: true}
 	}
 	c.setHeaders(req, jwt)
 	c.stats.Requests++
 	res, err := c.hc.Do(req)
 	if err != nil {
-		return "", time.Time{}, &Error{Kind: KindNetwork, Op: "minting installation token", Err: err}
+		return "", time.Time{}, &Error{Kind: KindNetwork, Op: "minting installation token", Err: err, mint: true}
 	}
 	defer res.Body.Close() //nolint:errcheck // body fully read below
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxBody))
+	body, err := readBody(res.Body)
 	if err != nil {
-		return "", time.Time{}, &Error{Kind: KindNetwork, Op: "minting installation token", Err: err}
+		return "", time.Time{}, &Error{Kind: KindNetwork, Op: "minting installation token", Err: err, mint: true}
 	}
 	// The access_tokens endpoint is billed to the App, not the installation,
 	// so its rate-limit headers are deliberately not recorded.
 	if res.StatusCode != http.StatusCreated && res.StatusCode != http.StatusOK {
-		return "", time.Time{}, &Error{Kind: KindAuth, Status: res.StatusCode, Op: "minting installation token", Err: errors.New(apiMessage(body))}
+		return "", time.Time{}, &Error{Kind: mintKind(res.StatusCode), Status: res.StatusCode, Op: "minting installation token", Err: errors.New(apiMessage(body)), mint: true}
 	}
 	var out struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil || out.Token == "" {
-		return "", time.Time{}, &Error{Kind: KindAuth, Op: "minting installation token", Err: errors.New("malformed access token response")}
+		return "", time.Time{}, &Error{Kind: KindAuth, Op: "minting installation token", Err: errors.New("malformed access token response"), mint: true}
 	}
-	if out.ExpiresAt.IsZero() {
-		out.ExpiresAt = now.Add(time.Hour)
+	return out.Token, localExpiry(now, out.ExpiresAt, res.Header.Get("Date")), nil
+}
+
+// mintKind classifies a failed token mint: server trouble is "5xx", rate
+// limiting "403", and anything else (bad App ID, key, or installation) "auth".
+func mintKind(status int) string {
+	switch {
+	case status >= 500:
+		return KindServer
+	case status == http.StatusTooManyRequests:
+		return KindForbidden
+	default:
+		return KindAuth
 	}
-	return out.Token, out.ExpiresAt, nil
+}
+
+// localExpiry converts GitHub's expires_at into our clock. The token's
+// lifetime is measured against the server's own Date header, so local clock
+// skew neither expires a fresh token early (re-minting on every request) nor
+// keeps a dead one. Without a usable Date it falls back to expires_at, capped
+// at the documented one-hour lifetime.
+func localExpiry(localNow, expiresAt time.Time, date string) time.Time {
+	if expiresAt.IsZero() {
+		return localNow.Add(time.Hour)
+	}
+	if serverNow, err := http.ParseTime(date); err == nil {
+		if ttl := expiresAt.Sub(serverNow); ttl > 0 && ttl <= 2*time.Hour {
+			return localNow.Add(ttl)
+		}
+	}
+	if capAt := localNow.Add(time.Hour); expiresAt.After(capAt) {
+		return capAt
+	}
+	return expiresAt
 }

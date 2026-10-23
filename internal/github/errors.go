@@ -25,6 +25,9 @@ type Error struct {
 	Status int // HTTP status, 0 if no response
 	Op     string
 	Err    error
+	// mint marks failures of the token mint itself, which a 401 retry must
+	// not repeat.
+	mint bool
 }
 
 func (e *Error) Error() string {
