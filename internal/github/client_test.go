@@ -57,10 +57,12 @@ type fakeAPI struct {
 	t        *testing.T
 	clock    *fakeClock
 	tokenTTL time.Duration
-	mu       sync.Mutex
-	mints    int
-	jwts     []string
-	handler  http.HandlerFunc
+	// skew offsets the server's clock (Date header and expires_at) from ours.
+	skew    time.Duration
+	mu      sync.Mutex
+	mints   int
+	jwts    []string
+	handler http.HandlerFunc
 }
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -70,10 +72,12 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n := f.mints
 		f.jwts = append(f.jwts, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 		f.mu.Unlock()
+		serverNow := f.clock.Now().Add(f.skew)
+		w.Header().Set("Date", serverNow.UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"token":      fmt.Sprintf("tok-%d", n),
-			"expires_at": f.clock.Now().Add(f.tokenTTL).UTC().Format(time.RFC3339),
+			"expires_at": serverNow.Add(f.tokenTTL).UTC().Format(time.RFC3339),
 		})
 		return
 	}
@@ -175,12 +179,17 @@ func TestAppJWT(t *testing.T) {
 func TestTokenRefresh(t *testing.T) {
 	tests := []struct {
 		name      string
+		skew      time.Duration
 		advance   time.Duration
 		wantMints int
 	}{
 		{name: "fresh token reused", advance: 30 * time.Minute, wantMints: 1},
 		{name: "near expiry re-minted", advance: 51 * time.Minute, wantMints: 2},
 		{name: "expired re-minted", advance: 2 * time.Hour, wantMints: 2},
+		// Our clock 2h ahead of GitHub's: expires_at is already in our past,
+		// but the token's real lifetime (from the Date header) is an hour.
+		{name: "server clock behind: still reused", skew: -2 * time.Hour, advance: 30 * time.Minute, wantMints: 1},
+		{name: "server clock ahead: still refreshed", skew: 2 * time.Hour, advance: 51 * time.Minute, wantMints: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -189,6 +198,7 @@ func TestTokenRefresh(t *testing.T) {
 				seen = append(seen, r.Header.Get("Authorization"))
 				_, _ = w.Write([]byte(`{}`))
 			})
+			api.skew = tt.skew
 			ctx := context.Background()
 			if _, err := c.Get(ctx, "/x"); err != nil {
 				t.Fatal(err)
@@ -344,20 +354,114 @@ func TestErrorKinds(t *testing.T) {
 			t.Fatalf("KindOf(%v) = %q", err, KindOf(err))
 		}
 	})
-	t.Run("mint refused", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusUnauthorized)
-		}))
-		t.Cleanup(srv.Close)
-		c, err := New(7, 42, pkcs1PEM(t), Options{BaseURL: srv.URL})
-		if err != nil {
-			t.Fatal(err)
+	mintTests := []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"mint refused 401", http.StatusUnauthorized, KindAuth},
+		{"mint refused 403", http.StatusForbidden, KindAuth},
+		{"mint bad installation 404", http.StatusNotFound, KindAuth},
+		{"mint rate limited 429", http.StatusTooManyRequests, KindForbidden},
+		{"mint server error 502", http.StatusBadGateway, KindServer},
+	}
+	for _, tt := range mintTests {
+		t.Run(tt.name, func(t *testing.T) {
+			mints, gets := 0, 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					mints++
+				} else {
+					gets++
+				}
+				w.WriteHeader(tt.status)
+			}))
+			t.Cleanup(srv.Close)
+			c, err := New(7, 42, pkcs1PEM(t), Options{BaseURL: srv.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.Get(context.Background(), "/x")
+			if KindOf(err) != tt.want {
+				t.Fatalf("KindOf(%v) = %q, want %q", err, KindOf(err), tt.want)
+			}
+			// A failed mint is not retried as if the API call had 401'd.
+			if mints != 1 || gets != 0 {
+				t.Fatalf("mints = %d, gets = %d; want 1, 0", mints, gets)
+			}
+		})
+	}
+}
+
+func TestOversizedBody(t *testing.T) {
+	big := strings.Repeat("x", maxBody+1)
+	calls := 0
+	c, _, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("If-None-Match") != "" {
+			t.Error("a truncated body was cached")
 		}
-		_, err = c.Get(context.Background(), "/x")
-		if KindOf(err) != KindAuth {
-			t.Fatalf("KindOf(%v) = %q", err, KindOf(err))
-		}
+		w.Header().Set("ETag", `"big"`)
+		_, _ = w.Write([]byte(big))
 	})
+	for range 2 {
+		_, err := c.Get(context.Background(), "/x")
+		if KindOf(err) != KindParse {
+			t.Fatalf("KindOf(%v) = %q, want parse", err, KindOf(err))
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d", calls)
+	}
+}
+
+func TestMultiPageETag(t *testing.T) {
+	var log []string // "path?query status"
+	c, _, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		etag := `"p` + page + `"`
+		w.Header().Set("ETag", etag)
+		status := http.StatusOK
+		if r.Header.Get("If-None-Match") == etag {
+			status = http.StatusNotModified
+		}
+		log = append(log, fmt.Sprintf("%s %d", r.URL.RequestURI(), status))
+		if status == http.StatusNotModified {
+			w.WriteHeader(status)
+			return
+		}
+		if page == "1" {
+			w.Header().Set("Link", `<http://`+r.Host+`/x?page=2>; rel="next"`)
+		}
+		_, _ = fmt.Fprintf(w, `{"page":%s}`, page)
+	})
+	ctx := context.Background()
+	walk := func() []string {
+		var bodies []string
+		for next := "/x?page=1"; next != ""; {
+			res, err := c.Get(ctx, next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodies = append(bodies, string(res.Body))
+			next = res.Next
+		}
+		return bodies
+	}
+	c.BeginPoll()
+	first := walk()
+	c.EndPoll()
+	c.BeginPoll()
+	second := walk() // page 1 is a 304; its Next must come from the cache
+	c.EndPoll()
+	want := []string{`{"page":1}`, `{"page":2}`}
+	if fmt.Sprint(first) != fmt.Sprint(want) || fmt.Sprint(second) != fmt.Sprint(want) {
+		t.Fatalf("bodies = %q / %q", first, second)
+	}
+	wantLog := []string{"/x?page=1 200", "/x?page=2 200", "/x?page=1 304", "/x?page=2 304"}
+	if fmt.Sprint(log) != fmt.Sprint(wantLog) {
+		t.Fatalf("requests = %q, want %q", log, wantLog)
+	}
 }
 
 func TestNextLink(t *testing.T) {
