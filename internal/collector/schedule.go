@@ -28,7 +28,12 @@ func parseSchedules(content []byte) ([]string, error) {
 	if !isMap(doc) {
 		return nil, errors.New("workflow is not a YAML mapping")
 	}
-	on, _ := lookup(doc, func(k any) bool { return k == "on" || k == true })
+	// Prefer a literal "on" key; a YAML 1.1 `true` key is only the fallback,
+	// so a file carrying both resolves deterministically.
+	on, ok := lookup(doc, func(k any) bool { return k == "on" })
+	if !ok {
+		on, _ = lookup(doc, func(k any) bool { return k == true })
+	}
 	if !isMap(on) {
 		return nil, nil
 	}

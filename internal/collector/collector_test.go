@@ -1017,30 +1017,61 @@ func TestRunStopsOnShutdown(t *testing.T) {
 func TestPollDeadlineCountsAsNetwork(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	gh := standardFixture(t, now)
-	gh.delay["/repos/octo-org/nightly/actions/workflows/1/runs"] = 2 * time.Second
+	gh.repos = append(gh.repos, repository{FullName: "octo-org/other", DefaultBranch: "main"})
+	gh.workflows["octo-org/other"] = []workflow{{ID: 50, Path: ".github/workflows/sync.yml", State: "active"}}
+	gh.files["octo-org/other"] = map[string]string{".github/workflows/sync.yml": dailyYAML}
+	gh.runs[50] = []run{ghRun("octo-org/other", 501, now.Add(-time.Hour), "schedule", "success")}
 	h := newHarness(t, gh, standardConfig)
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := h.series(t)
+
+	// The first workflow's runs hang past the poll deadline. Everything
+	// after it (deploy.yml, the whole second repo) is skipped and keeps its
+	// previous series, and the overrun is counted and logged exactly once.
+	gh.mu.Lock()
+	gh.delay["/repos/octo-org/nightly/actions/workflows/1/runs"] = 2 * time.Second
+	sent := len(gh.requests)
+	gh.mu.Unlock()
 	h.c.pollTimeout = 100 * time.Millisecond
 	if err := h.c.Poll(context.Background()); err == nil {
 		t.Fatal("poll that overran its deadline succeeded")
 	}
 	got := h.series(t)
-	if got[`gh_exporter_poll_errors_total{kind=network}`] < 1 {
-		t.Errorf("deadline not counted as network: %v", got[`gh_exporter_poll_errors_total{kind=network}`])
+	if n := got[`gh_exporter_poll_errors_total{kind=network}`]; n != 1 {
+		t.Errorf("network errors = %v, want exactly 1", n)
+	}
+	if n := strings.Count(h.logs.String(), "poll deadline exceeded"); n != 1 {
+		t.Errorf("deadline logged %d times, want 1:\n%s", n, h.logs.String())
 	}
 	if !strings.Contains(h.logs.String(), "deadline exceeded") {
 		t.Errorf("deadline error not logged:\n%s", h.logs.String())
 	}
+	gh.mu.Lock()
+	for _, u := range gh.requests[sent:] {
+		if strings.Contains(u.Path, "octo-org/other") || strings.HasSuffix(u.Path, "/workflows/3/runs") {
+			t.Errorf("request after the deadline: %s", u)
+		}
+	}
+	gh.mu.Unlock()
+	if !mapsEqual(before, got, "gh_exporter_") {
+		t.Errorf("series changed on an overrun poll")
+	}
 
 	// Shutdown (the parent context ending) is not counted.
-	before := got[`gh_exporter_poll_errors_total{kind=network}`]
+	gh.mu.Lock()
+	delete(gh.delay, "/repos/octo-org/nightly/actions/workflows/1/runs")
+	gh.mu.Unlock()
+	beforeShutdown := got[`gh_exporter_poll_errors_total{kind=network}`]
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	h.c.pollTimeout = 0
 	if err := h.c.Poll(ctx); err == nil {
 		t.Fatal("cancelled poll succeeded")
 	}
-	if after := h.series(t)[`gh_exporter_poll_errors_total{kind=network}`]; after != before {
-		t.Errorf("shutdown counted as an error: %v -> %v", before, after)
+	if after := h.series(t)[`gh_exporter_poll_errors_total{kind=network}`]; after != beforeShutdown {
+		t.Errorf("shutdown counted as an error: %v -> %v", beforeShutdown, after)
 	}
 }
 
@@ -1055,6 +1086,23 @@ func TestMissingContentsPermissionWarnsOnce(t *testing.T) {
 	}
 	if n := strings.Count(h.logs.String(), "Contents: read"); n != 1 {
 		t.Errorf("permission warning logged %d times, want 1", n)
+	}
+
+	// Readable again, then hidden again: the warning fires anew.
+	gh.mu.Lock()
+	gh.files[nightly] = map[string]string{".github/workflows/build.yml": dailyYAML}
+	gh.mu.Unlock()
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	gh.mu.Lock()
+	delete(gh.files, nightly)
+	gh.mu.Unlock()
+	if err := h.c.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(h.logs.String(), "Contents: read"); n != 2 {
+		t.Errorf("permission warning logged %d times after a recovery, want 2", n)
 	}
 }
 

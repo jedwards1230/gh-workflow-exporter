@@ -115,7 +115,13 @@ func (c *Client) mintLocked(ctx context.Context, now time.Time) (string, time.Ti
 	defer res.Body.Close() //nolint:errcheck // body fully read below
 	body, err := readBody(res.Body)
 	if err != nil {
-		return "", time.Time{}, &Error{Kind: KindNetwork, Op: "minting installation token", Err: err, mint: true}
+		kind := KindNetwork
+		var e *Error
+		if errors.As(err, &e) {
+			kind = e.Kind // an oversized body is "parse", as for GET
+			err = e.Err
+		}
+		return "", time.Time{}, &Error{Kind: kind, Op: "minting installation token", Err: err, mint: true}
 	}
 	// The access_tokens endpoint is billed to the App, not the installation,
 	// so its rate-limit headers are deliberately not recorded.

@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// TestParseSchedulesPrefersOnKey: with both a literal `on` and a YAML 1.1
+// `true` key, `on` wins every time regardless of map iteration order.
+func TestParseSchedulesPrefersOnKey(t *testing.T) {
+	doc := []byte("true:\n  schedule:\n    - cron: '1 1 * * *'\non:\n  schedule:\n    - cron: '2 2 * * *'\n")
+	for range 50 {
+		got, err := parseSchedules(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, []string{"2 2 * * *"}) {
+			t.Fatalf("got %q, want the `on` key's cron", got)
+		}
+	}
+}
+
 func TestParseSchedules(t *testing.T) {
 	tests := []struct {
 		name    string

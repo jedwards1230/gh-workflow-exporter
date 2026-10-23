@@ -135,9 +135,11 @@ type poll struct {
 	ctx      context.Context
 	parent   context.Context
 	failures int
-	seen     map[string]bool
-	matched  map[string]bool // include keys found this poll
-	shas     map[string]bool // parsed-cache entries still in use
+	// overran is set once the per-poll deadline has been counted.
+	overran bool
+	seen    map[string]bool
+	matched map[string]bool // include keys found this poll
+	shas    map[string]bool // parsed-cache entries still in use
 }
 
 // fail counts and logs an error that makes this poll unsuccessful. Errors
@@ -148,8 +150,29 @@ func (c *Collector) fail(p *poll, err error, msg string, attrs ...any) {
 	if p.parent.Err() != nil {
 		return
 	}
+	if p.ctx.Err() != nil {
+		// Past the deadline every remaining request fails the same way:
+		// count and log the overrun once, not once per request.
+		if !p.overran {
+			p.overran = true
+			c.m.pollErrors.WithLabelValues(github.KindNetwork).Inc()
+			c.log.Warn("poll deadline exceeded; remaining repos and workflows keep their previous values",
+				append(attrs, "kind", github.KindNetwork, "err", err)...)
+		}
+		return
+	}
 	c.m.pollErrors.WithLabelValues(github.KindOf(err)).Inc()
 	c.log.Warn(msg, append(attrs, "kind", github.KindOf(err), "err", err)...)
+}
+
+// expired reports whether the poll is out of time (deadline or shutdown),
+// recording the failure so the poll cannot count as successful.
+func (c *Collector) expired(p *poll) bool {
+	if err := p.ctx.Err(); err != nil {
+		c.fail(p, err, "poll stopped early")
+		return true
+	}
+	return false
 }
 
 // Poll runs one discovery-and-collect pass. It returns an error if any
@@ -180,6 +203,11 @@ func (c *Collector) Poll(parent context.Context) error {
 				continue
 			}
 			visible[strings.ToLower(r.FullName)] = true
+			if c.expired(p) {
+				// Out of time: keep what we had for the repos not reached.
+				c.carryOver(p, r.FullName)
+				continue
+			}
 			c.pollRepo(p, r)
 		}
 		// Forget repos that are gone, archived, or no longer granted.
@@ -281,6 +309,11 @@ func (c *Collector) pollRepo(p *poll, r repository) {
 	files := c.workflowFiles(p, r, workflows)
 
 	for _, wf := range workflows {
+		if c.expired(p) {
+			// Out of time: the rest of this repo keeps its previous values.
+			c.carryOver(p, r.FullName)
+			return
+		}
 		name := path.Base(wf.Path)
 		key := config.Key(r.FullName, name)
 		if c.cfg.Excluded(r.FullName, name) {
@@ -402,6 +435,7 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 		c.fail(p, err, "listing workflow files", "repo", r.FullName)
 		return c.files[key]
 	}
+	delete(c.warnedNoContents, key) // readable again: warn anew if it regresses
 	files := make(map[string]string, len(entries))
 	for _, e := range entries {
 		if e.Type == "file" {

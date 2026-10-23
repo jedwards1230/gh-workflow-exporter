@@ -415,6 +415,22 @@ func TestOversizedBody(t *testing.T) {
 	}
 }
 
+func TestOversizedMintBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(strings.Repeat("x", maxBody+1)))
+	}))
+	t.Cleanup(srv.Close)
+	c, err := New(7, 42, pkcs1PEM(t), Options{BaseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Get(context.Background(), "/x")
+	if KindOf(err) != KindParse {
+		t.Fatalf("KindOf(%v) = %q, want parse", err, KindOf(err))
+	}
+}
+
 func TestMultiPageETag(t *testing.T) {
 	var log []string // "path?query status"
 	c, _, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
