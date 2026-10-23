@@ -22,7 +22,8 @@ Every `poll_interval` (default 5m), one request at a time:
    changes; the result is cached by SHA.
 4. For every watched workflow, `GET .../actions/workflows/{id}/runs?per_page=10`,
    paging back (up to 5 pages) only when the first page holds no qualifying
-   success.
+   success. If those 50 runs hold none and no success is known yet, a deep
+   search pages `?per_page=100` (up to 5 pages, 500 runs).
 
 Every GET is revalidated with `If-None-Match`, so a warm poll is almost
 entirely `304 Not Modified` responses, which GitHub does not count against the
@@ -45,6 +46,13 @@ default branch):
 - *Last success*: for scheduled workflows, the newest `success` with
   `event=schedule` (a manual re-run says nothing about the schedule). For
   include-list workflows, the newest `success` of any event.
+- If the history runs out without a qualifying success, the last success is
+  `0` (never succeeded). If the search hits its cap first, a previously seen
+  success is kept; with none known (for example right after a restart, since
+  state is in memory), the deep search runs. If even that is capped, the last
+  success is *unknown*: no `last_success` series is exported for the workflow
+  (a warning is logged once, and no error is counted), rather than a `0` that
+  would read as "never succeeded".
 - Observations never go backwards. A "newest" run older than one already seen
   is ignored, and the last success only moves forward. A streak of cancelled
   runs therefore leaves the last success at the older success, and the Stale
@@ -134,7 +142,7 @@ Every key is optional. Unknown keys are rejected. See
 | `github_workflow_last_run_conclusion` | `repo`, `workflow`, `branch`, `event`, `conclusion` | `1` for the latest completed run on the tracked branch (any event). Exactly one series per workflow: the old one is deleted when a label changes. |
 | `github_workflow_last_run_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of that run |
 | `github_workflow_last_run_url_info` | `repo`, `workflow`, `run_url` | `1`; the URL of that run, for alert links |
-| `github_workflow_last_success_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of the last success that counts (scheduled workflows: `event=schedule` only). `0` if none was found, so a never-succeeded workflow is stale. |
+| `github_workflow_last_success_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of the last success that counts (scheduled workflows: `event=schedule` only). `0` when the whole run history was searched without one, so a never-succeeded workflow is stale. **Absent** when the history is longer than the search cap (550 runs) and no success was found in it. |
 | `github_workflow_expected_interval_seconds` | `repo`, `workflow` | Shortest gap between consecutive fires across all of the workflow's crons, in UTC. Scheduled workflows only. |
 | `github_workflow_grace_factor` | `repo`, `workflow` | Effective grace factor. Scheduled workflows only. |
 | `github_workflow_state` | `repo`, `workflow`, `state` | `1` for the current state: `active`, `disabled_inactivity`, `disabled_manually`, … |

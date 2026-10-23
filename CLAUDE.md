@@ -17,7 +17,7 @@ as a stable API.
 | `internal/config` | YAML config (include/exclude/overrides, strict keys, validation) and App credentials from env or the secret dir |
 | `internal/github` | Sequential REST client: App JWT → installation token (cached, re-minted <10 min before expiry, once on 401), ETag cache with per-poll eviction, Link pagination, error kinds, request stats |
 | `internal/cronx` | Expected interval = shortest gap between fires across all cron entries (robfig/cron, 5-field, UTC) |
-| `internal/collector` | The poll: discovery, workflow-file SHA cache + `on.schedule` parsing, run selection (client-side filtering, ≤5 pages), no-going-backwards merge, metric emission and series deletion |
+| `internal/collector` | The poll: discovery, workflow-file SHA cache + `on.schedule` parsing, run selection (client-side filtering; shallow ≤5×10 runs, then a deep ≤5×100 search only when no success is known), no-going-backwards merge, metric emission and series deletion |
 | `internal/version` | Build stamping via `-ldflags` |
 
 ## Invariants
@@ -30,6 +30,9 @@ as a stable API.
   `_state` series per workflow; a workflow that stops being watched loses
   every series. A failed request never deletes series: only positive evidence
   (listing succeeded and the thing is gone) does.
+- `last_success` semantics: a value when found (or previously seen), `0` only
+  when the run history was exhausted, and *no series* when the search was
+  capped with nothing known. Never emit `0` for "didn't look far enough".
 - A poll with any API error does not advance
   `gh_exporter_last_poll_success_timestamp_seconds` or readiness.
 - Never log the private key or the installation token.

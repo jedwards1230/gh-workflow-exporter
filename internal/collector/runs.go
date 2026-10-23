@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// maxRunPages caps how far back the runs listing is paged when the first
-// page holds no qualifying success.
+// maxRunPages caps how far back each runs listing (shallow per_page=10, then
+// deep per_page=100) is paged when no qualifying success has been found.
 const maxRunPages = 5
 
 // run is the subset of a workflow run the exporter reads.

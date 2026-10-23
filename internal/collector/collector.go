@@ -67,6 +67,10 @@ type workflowState struct {
 	// observed is set once a runs listing has succeeded; until then nothing
 	// is emitted, so a failed first fetch cannot publish a bogus 0 success.
 	observed bool
+	// successUnknown: no last success observed and the run history was too
+	// long to search to the end, so last_success is not exported.
+	successUnknown bool
+	warnedUnknown  bool
 
 	conclusion []string
 	runURL     []string
@@ -287,7 +291,7 @@ func (c *Collector) pollRepo(p *poll, r repository) {
 		p.seen[key] = true
 
 		sel := &selector{repo: r.FullName, branch: branch, scheduled: scheduled}
-		if err := c.fetchRuns(ctx, r.FullName, wf.ID, sel); err != nil {
+		if err := c.collectRuns(ctx, st, wf.ID, sel); err != nil {
 			c.fail(p, err, "listing workflow runs", "repo", r.FullName, "workflow", name)
 		} else {
 			st.obs.merge(sel)
@@ -435,31 +439,70 @@ func escapePath(p string) string {
 	return strings.Join(parts, "/")
 }
 
-// fetchRuns feeds the selector with the workflow's runs, newest first, paging
-// only while no qualifying success has been seen and at most maxRunPages
-// deep. The listing is never filtered server-side with event= or branch=:
-// GitHub answers those from a lagging index that can return stale or empty
-// results with a 200.
-func (c *Collector) fetchRuns(ctx context.Context, repo string, workflowID int64, sel *selector) error {
-	next := fmt.Sprintf("%s/actions/workflows/%d/runs?per_page=10", repoPath(repo), workflowID)
+// collectRuns feeds the selector from the runs listing and settles whether
+// the workflow's last success is known.
+//
+// The shallow listing (per_page=10, at most maxRunPages pages) is enough
+// almost always. When it hits its cap without a qualifying success:
+//   - a previously observed success is kept (no going backwards) and nothing
+//     more is fetched;
+//   - otherwise a deep listing (per_page=100, at most maxRunPages pages) is
+//     searched. A workflow that also runs on push, PRs or Dependabot can
+//     bury its last scheduled success under more than 50 other runs, and
+//     state is in memory, so this happens after every restart.
+//
+// If even the deep listing is capped, the last success is unknown: no series
+// is emitted for it (an "absent" is honest; a 0 would page as "never
+// succeeded"). Only a listing that ran out of history means "none".
+func (c *Collector) collectRuns(ctx context.Context, st *workflowState, workflowID int64, sel *selector) error {
+	base := fmt.Sprintf("%s/actions/workflows/%d/runs", repoPath(st.repo), workflowID)
+	capped, err := c.fetchRuns(ctx, base+"?per_page=10", st.repo, sel)
+	if err != nil {
+		return err
+	}
+	if capped && st.obs.lastSuccess.IsZero() {
+		if capped, err = c.fetchRuns(ctx, base+"?per_page=100", st.repo, sel); err != nil {
+			return err
+		}
+	}
+	st.successUnknown = capped && sel.success == nil && st.obs.lastSuccess.IsZero()
+	switch {
+	case st.successUnknown && !st.warnedUnknown:
+		st.warnedUnknown = true
+		c.log.Warn("last success not found within the deep search cap; not exporting last_success",
+			"repo", st.repo, "workflow", st.workflow, "branch", st.branch, "max_runs", maxRunPages*100)
+	case !st.successUnknown:
+		st.warnedUnknown = false
+	}
+	return nil
+}
+
+// fetchRuns feeds the selector from first and its next pages, newest first,
+// stopping at a qualifying success or after maxRunPages pages. It reports
+// capped=true when it stopped at the page cap with more history left. The
+// listing is never filtered server-side with event= or branch=: GitHub
+// answers those from a lagging index that can return stale or empty results
+// with a 200.
+func (c *Collector) fetchRuns(ctx context.Context, first, repo string, sel *selector) (capped bool, err error) {
+	next := first
 	for page := 1; page <= maxRunPages && next != ""; page++ {
 		res, err := c.api.Get(ctx, next)
 		if err != nil {
-			return err
+			return false, err
 		}
 		var body struct {
 			Runs []run `json:"workflow_runs"`
 		}
 		if err := github.Decode(res.Body, &body, "decoding runs of "+repo); err != nil {
-			return err
+			return false, err
 		}
 		sel.add(body.Runs)
 		if sel.done() {
-			return nil
+			return false, nil
 		}
 		next = res.Next
 	}
-	return nil
+	return next != "", nil
 }
 
 // emit writes a workflow's series, replacing any label set that changed.
@@ -475,11 +518,15 @@ func (c *Collector) emit(st *workflowState, state string, scheduled bool, sched 
 		m.lastRunTimestamp.WithLabelValues(st.repo, st.workflow, st.branch).Set(float64(r.CreatedAt.Unix()))
 		st.runURL = swap(m.lastRunURL, st.runURL, []string{st.repo, st.workflow, r.HTMLURL})
 	}
-	var success float64
-	if !st.obs.lastSuccess.IsZero() {
-		success = float64(st.obs.lastSuccess.Unix())
+	switch {
+	case !st.obs.lastSuccess.IsZero():
+		m.lastSuccess.WithLabelValues(st.repo, st.workflow, st.branch).Set(float64(st.obs.lastSuccess.Unix()))
+	case st.successUnknown:
+		m.lastSuccess.DeleteLabelValues(st.repo, st.workflow, st.branch)
+	default:
+		// History exhausted without a qualifying success: never succeeded.
+		m.lastSuccess.WithLabelValues(st.repo, st.workflow, st.branch).Set(0)
 	}
-	m.lastSuccess.WithLabelValues(st.repo, st.workflow, st.branch).Set(success)
 
 	if scheduled {
 		m.expectedInterval.WithLabelValues(st.repo, st.workflow).Set(sched.interval.Seconds())

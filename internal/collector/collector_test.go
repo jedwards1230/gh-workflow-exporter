@@ -45,7 +45,7 @@ type fakeGitHub struct {
 	requests     []*url.URL
 	notModified  int
 	fileFetches  int
-	runPageFetch map[int64]int // workflow id -> pages fetched
+	runPageFetch map[string]int // "<workflow id>/<per_page>" -> pages fetched
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -55,7 +55,7 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		files:        map[string]map[string]string{},
 		runs:         map[int64][]run{},
 		fail:         map[string]int{},
-		runPageFetch: map[int64]int{},
+		runPageFetch: map[string]int{},
 	}
 }
 
@@ -152,7 +152,7 @@ func (f *fakeGitHub) route(r *http.Request) (any, string, int) {
 		if page == 0 {
 			page = 1
 		}
-		f.runPageFetch[id]++
+		f.runPageFetch[fmt.Sprintf("%d/%d", id, perPage)]++
 		all := f.runs[id]
 		lo, hi := min((page-1)*perPage, len(all)), min(page*perPage, len(all))
 		next := ""
@@ -460,51 +460,152 @@ func assertNoServerSideFilters(t *testing.T, reqs []*url.URL) {
 	}
 }
 
+const lastSuccessKey = `github_workflow_last_success_timestamp_seconds{branch=main,repo=octo-org/nightly,workflow=build.yml}`
+
+// pagingFixture: one scheduled workflow whose runs are all scheduled
+// failures except a success at index successAt (-1: none), newest first.
+func pagingFixture(t *testing.T, now time.Time, total, successAt int) *fakeGitHub {
+	gh := newFakeGitHub(t)
+	gh.repos = []repository{{FullName: nightly, DefaultBranch: "main"}}
+	gh.workflows[nightly] = []workflow{{ID: 1, Path: ".github/workflows/build.yml", State: "active"}}
+	gh.files[nightly] = map[string]string{".github/workflows/build.yml": dailyYAML}
+	gh.runs[1] = pagingRuns(now, 0, total, successAt)
+	return gh
+}
+
+// pagingRuns builds runs with ids/ages offset by start, one hour apart.
+func pagingRuns(now time.Time, start, n, successAt int) []run {
+	var out []run
+	for i := start; i < start+n; i++ {
+		c := "failure"
+		if i == successAt {
+			c = "success"
+		}
+		out = append(out, ghRun(nightly, int64(100000-i), now.Add(-time.Duration(i+1)*time.Hour), "schedule", c))
+	}
+	return out
+}
+
 func TestRunPaging(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
+	const (
+		absent = -2 // no last_success series
+		zero   = -1 // series present with value 0
+	)
 	tests := []struct {
 		name        string
-		successAt   int // index of the only scheduled success; -1 none
 		total       int
-		wantPages   int
-		wantSuccess bool
+		successAt   int // -1: no success at all
+		wantShallow int // per_page=10 pages fetched
+		wantDeep    int // per_page=100 pages fetched
+		want        int // index of the success expected, or absent/zero
 	}{
-		{name: "success on page 1", successAt: 3, total: 40, wantPages: 1, wantSuccess: true},
-		{name: "success on page 3", successAt: 22, total: 40, wantPages: 3, wantSuccess: true},
-		{name: "success on page 5", successAt: 49, total: 80, wantPages: 5, wantSuccess: true},
-		{name: "success beyond cap", successAt: 55, total: 80, wantPages: 5, wantSuccess: false},
-		{name: "history shorter than cap", successAt: -1, total: 25, wantPages: 3, wantSuccess: false},
+		{name: "success on page 1", total: 40, successAt: 3, wantShallow: 1, want: 3},
+		{name: "success on page 3", total: 40, successAt: 22, wantShallow: 3, want: 22},
+		{name: "success on last shallow page", total: 80, successAt: 49, wantShallow: 5, want: 49},
+		{name: "history exhausted on page 1", total: 8, successAt: -1, wantShallow: 1, want: zero},
+		{name: "history exhausted before cap", total: 25, successAt: -1, wantShallow: 3, want: zero},
+		{name: "cap hit, deep search finds success", total: 80, successAt: 55, wantShallow: 5, wantDeep: 1, want: 55},
+		{name: "cap hit, deep search finds success on page 3", total: 400, successAt: 250, wantShallow: 5, wantDeep: 3, want: 250},
+		{name: "cap hit, deep history exhausted", total: 120, successAt: -1, wantShallow: 5, wantDeep: 2, want: zero},
+		{name: "cap hit, deep search capped", total: 600, successAt: 550, wantShallow: 5, wantDeep: 5, want: absent},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gh := newFakeGitHub(t)
-			gh.repos = []repository{{FullName: nightly, DefaultBranch: "main"}}
-			gh.workflows[nightly] = []workflow{{ID: 1, Path: ".github/workflows/build.yml", State: "active"}}
-			gh.files[nightly] = map[string]string{".github/workflows/build.yml": dailyYAML}
-			for i := range tt.total {
-				c := "failure"
-				if i == tt.successAt {
-					c = "success"
-				}
-				gh.runs[1] = append(gh.runs[1], ghRun(nightly, int64(1000-i), now.Add(-time.Duration(i+1)*time.Hour), "schedule", c))
-			}
+			gh := pagingFixture(t, now, tt.total, tt.successAt)
 			h := newHarness(t, gh, "")
 			if err := h.c.Poll(context.Background()); err != nil {
-				t.Fatal(err)
+				t.Fatalf("Poll: %v", err)
 			}
-			if gh.runPageFetch[1] != tt.wantPages {
-				t.Errorf("pages fetched = %d, want %d", gh.runPageFetch[1], tt.wantPages)
+			if got := gh.runPageFetch["1/10"]; got != tt.wantShallow {
+				t.Errorf("shallow pages = %d, want %d", got, tt.wantShallow)
 			}
-			got := h.series(t)[`github_workflow_last_success_timestamp_seconds{branch=main,repo=octo-org/nightly,workflow=build.yml}`]
-			want := 0.0
-			if tt.wantSuccess {
-				want = float64(now.Add(-time.Duration(tt.successAt+1) * time.Hour).Unix())
+			if got := gh.runPageFetch["1/100"]; got != tt.wantDeep {
+				t.Errorf("deep pages = %d, want %d", got, tt.wantDeep)
 			}
-			if got != want {
-				t.Errorf("last success = %v, want %v", got, want)
+			series := h.series(t)
+			got, present := series[lastSuccessKey]
+			switch tt.want {
+			case absent:
+				if present {
+					t.Errorf("last_success = %v, want no series", got)
+				}
+			case zero:
+				if !present || got != 0 {
+					t.Errorf("last_success = %v (present %v), want 0", got, present)
+				}
+			default:
+				want := float64(now.Add(-time.Duration(tt.want+1) * time.Hour).Unix())
+				if !present || got != want {
+					t.Errorf("last_success = %v (present %v), want %v", got, present, want)
+				}
+			}
+			// A capped search is not an error.
+			if series[`gh_exporter_poll_errors_total{kind=parse}`]+series[`gh_exporter_poll_errors_total{kind=404}`] != 0 {
+				t.Errorf("errors counted: %v", series)
 			}
 			assertNoServerSideFilters(t, gh.requests)
 		})
+	}
+}
+
+func TestRunPagingKeepsKnownSuccess(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := pagingFixture(t, now, 80, 3)
+	h := newHarness(t, gh, "")
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	known := h.series(t)[lastSuccessKey]
+	if known == 0 {
+		t.Fatal("first poll found no success")
+	}
+	// 60 newer non-success runs bury the success past the shallow cap.
+	gh.mu.Lock()
+	newer := make([]run, 0, 60)
+	for i := range 60 {
+		newer = append(newer, ghRun(nightly, int64(200000-i), now.Add(time.Duration(60-i)*time.Minute), "push", "success"))
+	}
+	gh.runs[1] = append(newer, gh.runs[1]...)
+	gh.runPageFetch = map[string]int{}
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.series(t)[lastSuccessKey]; got != known {
+		t.Errorf("last_success = %v, want kept %v", got, known)
+	}
+	if gh.runPageFetch["1/10"] != 5 || gh.runPageFetch["1/100"] != 0 {
+		t.Errorf("pages = %v, want 5 shallow and no deep", gh.runPageFetch)
+	}
+}
+
+func TestDeepSearchCappedThenResolved(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := pagingFixture(t, now, 600, -1)
+	h := newHarness(t, gh, "")
+	ctx := context.Background()
+	for range 2 {
+		if err := h.c.Poll(ctx); err != nil {
+			t.Fatalf("capped search must not fail the poll: %v", err)
+		}
+		if _, ok := h.series(t)[lastSuccessKey]; ok {
+			t.Fatal("last_success exported while unknown")
+		}
+	}
+	if !h.c.Ready() {
+		t.Fatal("not ready")
+	}
+	// A new scheduled success resolves it.
+	gh.mu.Lock()
+	gh.runs[1] = append([]run{ghRun(nightly, 300000, now, "schedule", "success")}, gh.runs[1]...)
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.series(t)[lastSuccessKey]; got != float64(now.Unix()) {
+		t.Errorf("last_success = %v, want %v", got, now.Unix())
 	}
 }
 
