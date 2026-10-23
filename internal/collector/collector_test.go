@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,7 +12,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +29,10 @@ import (
 	"github.com/jedwards1230/gh-workflow-exporter/internal/github"
 )
 
+// fakeToken is the installation token the fake mints; logs must never
+// contain it.
+const fakeToken = "ghs_FAKEinstallationTOKEN0123456789"
+
 // fakeGitHub is an in-memory GitHub REST API covering the endpoints the
 // exporter uses. Every GET answers with a content-derived ETag and honours
 // If-None-Match, like the real API.
@@ -41,6 +45,7 @@ type fakeGitHub struct {
 	files     map[string]map[string]string // repo -> path -> content
 	runs      map[int64][]run              // workflow id -> runs, newest first
 	fail      map[string]int               // URL path -> forced status
+	delay     map[string]time.Duration     // URL path -> response delay
 
 	requests     []*url.URL
 	notModified  int
@@ -55,6 +60,7 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		files:        map[string]map[string]string{},
 		runs:         map[int64][]run{},
 		fail:         map[string]int{},
+		delay:        map[string]time.Duration{},
 		runPageFetch: map[string]int{},
 	}
 }
@@ -69,8 +75,16 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/access_tokens") {
 		w.WriteHeader(http.StatusCreated)
-		_, _ = fmt.Fprintf(w, `{"token":"tok","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		_, _ = fmt.Fprintf(w, `{"token":%q,"expires_at":%q}`, fakeToken, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
 		return
+	}
+	if d, ok := f.delay[r.URL.Path]; ok {
+		f.mu.Unlock()
+		select {
+		case <-time.After(d):
+		case <-r.Context().Done():
+		}
+		f.mu.Lock()
 	}
 	f.requests = append(f.requests, r.URL)
 	w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(5000-len(f.requests)))
@@ -191,10 +205,11 @@ var testKeyPEM = func() []byte {
 }()
 
 type harness struct {
-	gh  *fakeGitHub
-	c   *Collector
-	reg *prometheus.Registry
-	api *github.Client
+	logs *syncBuffer
+	gh   *fakeGitHub
+	c    *Collector
+	reg  *prometheus.Registry
+	api  *github.Client
 }
 
 func newHarness(t *testing.T, gh *fakeGitHub, cfgYAML string) *harness {
@@ -214,8 +229,48 @@ func newHarness(t *testing.T, gh *fakeGitHub, cfgYAML string) *harness {
 		t.Fatal(err)
 	}
 	reg := prometheus.NewRegistry()
-	c = New(api, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), reg)
-	return &harness{gh: gh, c: c, reg: reg, api: api}
+	logs := &syncBuffer{}
+	c = New(api, cfg, slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})), reg)
+	return &harness{logs: logs, gh: gh, c: c, reg: reg, api: api}
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// pollStats returns the requests/not_modified of every "poll complete" log
+// line so far, in order.
+func (h *harness) pollStats(t *testing.T) [][2]int {
+	t.Helper()
+	var out [][2]int
+	for _, line := range strings.Split(strings.TrimSpace(h.logs.String()), "\n") {
+		var rec struct {
+			Msg         string `json:"msg"`
+			Requests    int    `json:"requests"`
+			NotModified int    `json:"not_modified"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if rec.Msg == "poll complete" {
+			out = append(out, [2]int{rec.Requests, rec.NotModified})
+		}
+	}
+	return out
 }
 
 // series returns every sample as "name{k=v,...}" -> value, labels sorted.
@@ -343,9 +398,10 @@ func TestPollEndToEnd(t *testing.T) {
 	if !h.c.Ready() {
 		t.Fatal("not ready after successful poll")
 	}
-	first := h.api.TakeStats() // already taken by Poll; ensure reset
-	if first.Requests != 0 {
-		t.Fatalf("stats not reset by Poll: %+v", first)
+	// Cold poll: token mint + repos + workflows + workflow dir + 3 files
+	// (build, ci, deploy) + runs of build + runs of deploy.
+	if got := h.pollStats(t); len(got) != 1 || got[0] != [2]int{9, 0} {
+		t.Fatalf("cold poll stats = %v, want [[9 0]]", got)
 	}
 	got := h.series(t)
 	assertSeries(t, got, map[string]float64{
@@ -396,6 +452,9 @@ func TestPollEndToEnd(t *testing.T) {
 	// repos + workflows + dir + runs(build) + runs(deploy)
 	if len(warm) != 5 || gh.notModified-first304 != 5 {
 		t.Errorf("warm poll made %d requests (%d 304s), want 5 all 304: %v", len(warm), gh.notModified-first304, warm)
+	}
+	if got := h.pollStats(t); len(got) != 2 || got[1] != [2]int{5, 5} {
+		t.Errorf("warm poll stats = %v, want second [5 5]", got)
 	}
 	if !mapsEqual(got, h.series(t), "gh_exporter_last_poll_success", "gh_exporter_rate_limit") {
 		t.Errorf("warm poll changed series")
@@ -579,6 +638,29 @@ func TestRunPagingKeepsKnownSuccess(t *testing.T) {
 	if gh.runPageFetch["1/10"] != 5 || gh.runPageFetch["1/100"] != 0 {
 		t.Errorf("pages = %v, want 5 shallow and no deep", gh.runPageFetch)
 	}
+
+	// The known success's run disappears (deleted) and the newer runs are
+	// gone too: paging stops at the first page that reaches back past the
+	// known success instead of walking the whole cap.
+	gh.mu.Lock()
+	var kept []run
+	for _, r := range gh.runs[1][60:] {
+		if r.Conclusion != "success" {
+			kept = append(kept, r)
+		}
+	}
+	gh.runs[1] = kept // index 0..2 newer than the known success, then older
+	gh.runPageFetch = map[string]int{}
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gh.runPageFetch["1/10"] != 1 || gh.runPageFetch["1/100"] != 0 {
+		t.Errorf("pages = %v, want 1 shallow (stopped at the known success)", gh.runPageFetch)
+	}
+	if got := h.series(t)[lastSuccessKey]; got != known {
+		t.Errorf("last_success = %v, want kept %v", got, known)
+	}
 }
 
 func TestDeepSearchCappedThenResolved(t *testing.T) {
@@ -665,18 +747,29 @@ func TestSeriesReplacedAndDeleted(t *testing.T) {
 		`github_workflow_last_run_timestamp_seconds{branch=main,repo=octo-org/nightly,workflow=build.yml}`:                                     float64(now.Unix()),
 	})
 
-	// A branch override re-points the workflow: old-branch series go away.
+	// A branch override on a scheduled workflow re-points last_run_* at the
+	// override branch, but the last scheduled success is still searched on
+	// the default branch: schedules never fire anywhere else.
+	gh.mu.Lock()
+	release := ghRun(nightly, 108, now.Add(-30*time.Minute), "push", "success")
+	release.HeadBranch = "release"
+	gh.runs[1] = append([]run{release}, gh.runs[1]...)
+	gh.mu.Unlock()
 	h.c.cfg = mustConfig(t, standardConfig+"overrides:\n  - repo: octo-org/nightly\n    workflow: build.yml\n    branch: release\n    grace_factor: 3\n")
 	got = poll()
 	build = workflowSeries(got, nightly, "build.yml")
 	for k := range build {
-		if strings.Contains(k, "branch=main") {
-			t.Errorf("old-branch series survived: %s", k)
+		if strings.HasPrefix(k, "github_workflow_last_run_") && strings.Contains(k, "branch=main") {
+			t.Errorf("old-branch run series survived: %s", k)
+		}
+		if strings.HasPrefix(k, "github_workflow_last_success_") && strings.Contains(k, "branch=release") {
+			t.Errorf("last success tracked on the override branch: %s", k)
 		}
 	}
 	assertSeries(t, got, map[string]float64{
-		`github_workflow_last_success_timestamp_seconds{branch=release,repo=octo-org/nightly,workflow=build.yml}`: 0,
-		`github_workflow_grace_factor{repo=octo-org/nightly,workflow=build.yml}`:                                  3,
+		`github_workflow_last_run_conclusion{branch=release,conclusion=success,event=push,repo=octo-org/nightly,workflow=build.yml}`: 1,
+		`github_workflow_last_success_timestamp_seconds{branch=main,repo=octo-org/nightly,workflow=build.yml}`:                       float64(now.Add(-26 * time.Hour).Unix()),
+		`github_workflow_grace_factor{repo=octo-org/nightly,workflow=build.yml}`:                                                     3,
 	})
 
 	// Newly excluded: every series of the workflow is deleted.
@@ -804,8 +897,17 @@ func TestReadinessNeedsCleanPoll(t *testing.T) {
 func TestUnparsableCron(t *testing.T) {
 	gh := newFakeGitHub(t)
 	gh.repos = []repository{{FullName: nightly, DefaultBranch: "main"}}
-	gh.workflows[nightly] = []workflow{{ID: 1, Path: ".github/workflows/bad.yml", State: "active"}}
-	gh.files[nightly] = map[string]string{".github/workflows/bad.yml": badYAML}
+	gh.workflows[nightly] = []workflow{
+		{ID: 1, Path: ".github/workflows/bad.yml", State: "active"},
+		{ID: 2, Path: ".github/workflows/broken.yml", State: "active"},
+		{ID: 3, Path: ".github/workflows/sunday.yml", State: "active"},
+	}
+	gh.files[nightly] = map[string]string{
+		".github/workflows/bad.yml":    badYAML,
+		".github/workflows/broken.yml": "on: [\n",
+		".github/workflows/sunday.yml": "on:\n  schedule:\n    - cron: '0 4 * * 7'\n",
+	}
+	gh.runs[1] = []run{ghRun(nightly, 11, time.Now().Add(-time.Hour), "schedule", "failure")}
 	h := newHarness(t, gh, "")
 	for range 2 {
 		if err := h.c.Poll(context.Background()); err != nil {
@@ -813,12 +915,170 @@ func TestUnparsableCron(t *testing.T) {
 		}
 	}
 	got := h.series(t)
-	// Counted once per blob SHA, not once per poll.
+	// Counted once per blob SHA, not once per poll. The bad cron is still
+	// watched (state, last run) without interval series; invalid YAML is not;
+	// day-of-week 7 is Sunday.
 	assertSeries(t, got, map[string]float64{
-		`gh_exporter_poll_errors_total{kind=parse}`: 1,
-		`gh_exporter_watched_workflows{}`:           0,
+		`gh_exporter_poll_errors_total{kind=parse}`:                                  2,
+		`gh_exporter_watched_workflows{}`:                                            2,
+		`github_workflow_state{repo=octo-org/nightly,state=active,workflow=bad.yml}`: 1,
+		`github_workflow_last_run_conclusion{branch=main,conclusion=failure,event=schedule,repo=octo-org/nightly,workflow=bad.yml}`: 1,
+		`github_workflow_expected_interval_seconds{repo=octo-org/nightly,workflow=sunday.yml}`:                                      7 * 86400,
 	})
+	assertAbsent(t, got,
+		`github_workflow_expected_interval_seconds{repo=octo-org/nightly,workflow=bad.yml}`,
+		`github_workflow_grace_factor{repo=octo-org/nightly,workflow=bad.yml}`,
+		`github_workflow_state{repo=octo-org/nightly,state=active,workflow=broken.yml}`,
+	)
 	if !h.c.Ready() {
 		t.Fatal("not ready")
+	}
+}
+
+func TestConcurrentGatherDuringPoll(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := standardFixture(t, now)
+	h := newHarness(t, gh, standardConfig)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			mfs, err := h.reg.Gather()
+			if err != nil {
+				t.Errorf("Gather: %v", err)
+				return
+			}
+			// Never two conclusion (or url) series for one workflow.
+			for _, mf := range mfs {
+				name := mf.GetName()
+				if name != "github_workflow_last_run_conclusion" && name != "github_workflow_last_run_url_info" {
+					continue
+				}
+				seen := map[string]bool{}
+				for _, m := range mf.GetMetric() {
+					var repo, wf string
+					for _, l := range m.GetLabel() {
+						switch l.GetName() {
+						case "repo":
+							repo = l.GetValue()
+						case "workflow":
+							wf = l.GetValue()
+						}
+					}
+					if seen[repo+"/"+wf] {
+						t.Errorf("two %s series for %s/%s", name, repo, wf)
+					}
+					seen[repo+"/"+wf] = true
+				}
+			}
+		}
+	}()
+	conclusions := []string{"failure", "success", "cancelled", "timed_out"}
+	for i := range 40 {
+		gh.mu.Lock()
+		gh.runs[1] = append([]run{ghRun(nightly, int64(1000+i), now.Add(time.Duration(i)*time.Minute), "schedule", conclusions[i%4])}, gh.runs[1]...)
+		gh.mu.Unlock()
+		if err := h.c.Poll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cancel()
+	<-done
+}
+
+func TestRunStopsOnShutdown(t *testing.T) {
+	gh := standardFixture(t, time.Now())
+	h := newHarness(t, gh, standardConfig)
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		h.c.Run(ctx)
+		close(stopped)
+	}()
+	deadline := time.After(5 * time.Second)
+	for !h.c.Ready() {
+		select {
+		case <-deadline:
+			t.Fatal("first poll never completed")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after shutdown")
+	}
+}
+
+func TestPollDeadlineCountsAsNetwork(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := standardFixture(t, now)
+	gh.delay["/repos/octo-org/nightly/actions/workflows/1/runs"] = 2 * time.Second
+	h := newHarness(t, gh, standardConfig)
+	h.c.pollTimeout = 100 * time.Millisecond
+	if err := h.c.Poll(context.Background()); err == nil {
+		t.Fatal("poll that overran its deadline succeeded")
+	}
+	got := h.series(t)
+	if got[`gh_exporter_poll_errors_total{kind=network}`] < 1 {
+		t.Errorf("deadline not counted as network: %v", got[`gh_exporter_poll_errors_total{kind=network}`])
+	}
+	if !strings.Contains(h.logs.String(), "deadline exceeded") {
+		t.Errorf("deadline error not logged:\n%s", h.logs.String())
+	}
+
+	// Shutdown (the parent context ending) is not counted.
+	before := got[`gh_exporter_poll_errors_total{kind=network}`]
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.c.pollTimeout = 0
+	if err := h.c.Poll(ctx); err == nil {
+		t.Fatal("cancelled poll succeeded")
+	}
+	if after := h.series(t)[`gh_exporter_poll_errors_total{kind=network}`]; after != before {
+		t.Errorf("shutdown counted as an error: %v -> %v", before, after)
+	}
+}
+
+func TestMissingContentsPermissionWarnsOnce(t *testing.T) {
+	gh := standardFixture(t, time.Now())
+	delete(gh.files, nightly) // the dir 404s while workflows still list files
+	h := newHarness(t, gh, standardConfig)
+	for range 2 {
+		if err := h.c.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+	}
+	if n := strings.Count(h.logs.String(), "Contents: read"); n != 1 {
+		t.Errorf("permission warning logged %d times, want 1", n)
+	}
+}
+
+func TestLogsNeverContainSecrets(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	gh := standardFixture(t, now)
+	h := newHarness(t, gh, standardConfig)
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the error paths too: every request rejected.
+	gh.mu.Lock()
+	gh.fail["/installation/repositories"] = http.StatusUnauthorized
+	gh.fail["/repos/octo-org/nightly/actions/workflows"] = http.StatusInternalServerError
+	gh.mu.Unlock()
+	_ = h.c.Poll(ctx)
+	logs := h.logs.String()
+	if logs == "" {
+		t.Fatal("no logs captured")
+	}
+	for _, secret := range []string{fakeToken, "PRIVATE KEY", string(testKeyPEM[40:80])} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("logs contain secret material %q", secret)
+		}
 	}
 }
