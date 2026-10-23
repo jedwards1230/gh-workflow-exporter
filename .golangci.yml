@@ -1,0 +1,29 @@
+# golangci-lint config: the default (standard) linter set plus gosec.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - gosec
+  settings:
+    gosec:
+      excludes:
+        # G104 (unhandled errors) overlaps errcheck, which is already in the
+        # standard set and stricter.
+        - G104
+        # G704 (SSRF via taint analysis) is experimental and flags every
+        # http.Client.Do. Requests only go to the operator-configured API base
+        # URL; next-page links from GitHub are rejected unless they stay on
+        # that host (internal/github Client.resolve).
+        - G704
+  exclusions:
+    paths:
+      # Git worktrees are conventionally parked in ./worktrees/ (gitignored);
+      # a local run would otherwise lint whatever branch each one has checked
+      # out.
+      - worktrees/
+    rules:
+      # gosec's own default is -tests=false; restore it for test fixtures.
+      - path: _test\.go
+        linters:
+          - gosec

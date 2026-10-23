@@ -1,0 +1,34 @@
+# .github/.releaseignore -- dev-only paths for the release gate (gitignore syntax).
+# A merged PR whose changed files ALL match here releases nothing, unless it carries a
+# semver:* label (an explicit label always wins). Anything not matched is product and
+# releases as a patch. Read by .github/workflows/release.yml and
+# .github/workflows/semver-label.yml.
+# NOTE git semantics: a file can't be re-included if a parent DIRECTORY is excluded.
+#   docs/**  +  !docs/user/**   does NOT work (docs/user/ itself is excluded);
+#   docs/**  +  !docs/user/  +  !docs/user/**   does.
+#
+# Product (deliberately NOT listed): Go source, go.mod/go.sum, Dockerfile +
+# .dockerignore, example config, README.md, LICENSE.
+
+# CI and agent instructions
+/.github/
+/.claude/
+CLAUDE.md
+AGENTS.md
+/CONTRIBUTING*
+
+# Docs: not in the image
+/docs/
+
+# Tests
+*_test.go
+testdata/
+
+# Dev build wrapper (the Dockerfile and release call go build directly)
+/Makefile
+
+# Linter / formatter / git config
+/.golangci*
+/.pre-commit-config.yaml
+/.editorconfig
+/.gitignore
