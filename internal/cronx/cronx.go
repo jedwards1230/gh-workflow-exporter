@@ -133,11 +133,11 @@ func Interval(exprs []string) (time.Duration, error) {
 		}
 		var mins []int
 		for h := range 24 {
-			if s.Hour&(1<<uint(h)) == 0 {
+			if s.Hour&bit(h) == 0 {
 				continue
 			}
 			for m := range 60 {
-				if s.Minute&(1<<uint(m)) != 0 {
+				if s.Minute&bit(m) != 0 {
 					mins = append(mins, h*60+m)
 				}
 			}
@@ -192,13 +192,21 @@ func Interval(exprs []string) (time.Duration, error) {
 
 // dayMatches mirrors robfig/cron's day matching (month, then DOM/DOW).
 func dayMatches(s *cron.SpecSchedule, t time.Time) bool {
-	if s.Month&(1<<uint(t.Month())) == 0 {
+	if s.Month&bit(int(t.Month())) == 0 {
 		return false
 	}
-	dom := s.Dom&(1<<uint(t.Day())) != 0
-	dow := s.Dow&(1<<uint(t.Weekday())) != 0
+	dom := s.Dom&bit(t.Day()) != 0
+	dow := s.Dow&bit(int(t.Weekday())) != 0
 	if s.Dom&starBit != 0 || s.Dow&starBit != 0 {
 		return dom && dow
 	}
 	return dom || dow
+}
+
+// bit returns the SpecSchedule bitmask bit for a field value (all in 0..31).
+func bit(n int) uint64 {
+	if n < 0 || n > 63 {
+		return 0
+	}
+	return uint64(1) << n
 }
