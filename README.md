@@ -21,9 +21,10 @@ Every `poll_interval` (default 5m), one request at a time:
    fetched and its `on.schedule[].cron` entries parsed only when its blob SHA
    changes; the result is cached by SHA.
 4. For every watched workflow, `GET .../actions/workflows/{id}/runs?per_page=10`,
-   paging back (up to 5 pages) only when the first page holds no qualifying
-   success. If those 50 runs hold none and no success is known yet, a deep
-   search pages `?per_page=100` (up to 5 pages, 500 runs).
+   paging back (up to 5 pages) only while no qualifying success has been
+   found and the known last success has not been reached. If those 50 runs
+   run out first, a deep search pages `?per_page=100` the same way (up to 5
+   pages, 500 runs).
 
 Every GET is revalidated with `If-None-Match`, so a warm poll is almost
 entirely `304 Not Modified` responses, which GitHub does not count against the
@@ -36,23 +37,27 @@ results with a `200`. Filtering happens client-side.
 are identified by repo full name and file basename (`octo-org/nightly`,
 `build.yml`).
 
-**Run selection** (per workflow, on the tracked branch, default the repo's
-default branch):
+**Run selection.** The *tracked branch* is the repo's default branch unless
+an override sets `branch`.
 
-- Only completed runs whose `head_branch` is the tracked branch count.
-  Pull-request runs (`pull_request*` events, or a head repository other than
-  the repo itself) are ignored.
-- *Latest run*: the newest such run, any event.
+- Only completed runs count. Pull-request runs (`pull_request*` events, or a
+  head repository other than the repo itself) are ignored.
+- *Latest run*: the newest such run on the tracked branch, any event.
 - *Last success*: for scheduled workflows, the newest `success` with
-  `event=schedule` (a manual re-run says nothing about the schedule). For
-  include-list workflows, the newest `success` of any event.
+  `event=schedule` on the repo's **default branch**. GitHub only fires
+  schedules there, so a `branch` override moves the latest-run metrics but
+  not this one, and a manual or push success says nothing about the
+  schedule. For include-list workflows, the newest `success` of any event on
+  the tracked branch.
 - If the history runs out without a qualifying success, the last success is
-  `0` (never succeeded). If the search hits its cap first, a previously seen
-  success is kept; with none known (for example right after a restart, since
-  state is in memory), the deep search runs. If even that is capped, the last
-  success is *unknown*: no `last_success` series is exported for the workflow
-  (a warning is logged once, and no error is counted), rather than a `0` that
-  would read as "never succeeded".
+  `0` (never succeeded). If the 50-run search hits its cap first (for
+  example right after a restart, since state is in memory, or when more than
+  50 other runs landed since the last poll), a deep search covers the newest
+  500 runs. A previously seen success is always kept. If the deep search is
+  capped too and no success is known, the last success is *unknown*: no
+  `last_success` series is exported for the workflow (a warning is logged
+  once, and no error is counted), rather than a `0` that would read as
+  "never succeeded".
 - Observations never go backwards. A "newest" run older than one already seen
   is ignored, and the last success only moves forward. A streak of cancelled
   runs therefore leaves the last success at the older success, and the Stale
@@ -126,11 +131,11 @@ Every key is optional. Unknown keys are rejected. See
 
 | Key | Default | Meaning |
 |---|---|---|
-| `poll_interval` | `5m` | Time between polls (Go duration) |
+| `poll_interval` | `5m` | Time between polls (Go duration, at least `1m`). A poll that takes longer is cut off and counts as failed. |
 | `default_grace_factor` | `1.5` | Grace factor for every scheduled workflow without an override |
 | `include[]` | — | `{repo, workflow}` workflows without a schedule to watch anyway: failure tracking and last success of any event, with no interval or grace series |
 | `exclude[]` | — | `{repo, workflow}` workflows to ignore |
-| `overrides[]` | — | `{repo, workflow, branch, grace_factor}`. `branch` replaces the repo's default branch for run selection, and `grace_factor` replaces `default_grace_factor` |
+| `overrides[]` | — | `{repo, workflow, branch, grace_factor}`. `branch` replaces the repo's default branch for the latest-run metrics (and, for include-list workflows, the last success; a scheduled workflow's last success is always taken from the default branch). `grace_factor` replaces `default_grace_factor` |
 
 `repo` is `owner/name`. `workflow` is the file basename, for example
 `build.yml`. Matching is case-insensitive.
@@ -142,8 +147,8 @@ Every key is optional. Unknown keys are rejected. See
 | `github_workflow_last_run_conclusion` | `repo`, `workflow`, `branch`, `event`, `conclusion` | `1` for the latest completed run on the tracked branch (any event). Exactly one series per workflow: the old one is deleted when a label changes. |
 | `github_workflow_last_run_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of that run |
 | `github_workflow_last_run_url_info` | `repo`, `workflow`, `run_url` | `1`; the URL of that run, for alert links |
-| `github_workflow_last_success_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of the last success that counts (scheduled workflows: `event=schedule` only). `0` when the whole run history was searched without one, so a never-succeeded workflow is stale. **Absent** when the history is longer than the search cap (550 runs) and no success was found in it. |
-| `github_workflow_expected_interval_seconds` | `repo`, `workflow` | Shortest gap between consecutive fires across all of the workflow's crons, in UTC. Scheduled workflows only. |
+| `github_workflow_last_success_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of the last success that counts (scheduled workflows: `event=schedule` on the default branch, which is the `branch` label). `0` when the whole run history was searched without one, so a never-succeeded workflow is stale. **Absent** when the history is longer than the search cap (the newest 500 runs) and no success was found in it. |
+| `github_workflow_expected_interval_seconds` | `repo`, `workflow` | Longest gap in seconds between consecutive scheduled fires across all of the workflow's cron entries (their merged fire sequence, in UTC), at least 300 (GitHub's minimum schedule interval). A weekdays-only cron gets 72h, so a weekend is never stale. Scheduled workflows only, and absent if a cron cannot be evaluated. |
 | `github_workflow_grace_factor` | `repo`, `workflow` | Effective grace factor. Scheduled workflows only. |
 | `github_workflow_state` | `repo`, `workflow`, `state` | `1` for the current state: `active`, `disabled_inactivity`, `disabled_manually`, … |
 | `gh_exporter_last_poll_success_timestamp_seconds` | — | End of the last poll that completed without errors |
@@ -160,11 +165,21 @@ workflow keeps its last values until a later poll shows it is really gone.
 poll: the rest is still collected and exported. But any API, network, auth or
 response-decoding error marks the poll unsuccessful, so
 `gh_exporter_last_poll_success_timestamp_seconds` and readiness do not
-advance. A workflow file with unparsable YAML or an invalid cron is different:
-it is the repository's problem, not the exporter's. It is logged and counted
-once per file version as `kind="parse"`, the workflow is treated as
-unscheduled (GitHub will not schedule it either), and the poll still counts as
-successful.
+advance. A poll that overruns `poll_interval` is cut off and counted as
+`network`. Problems in a workflow file are different: they are the
+repository's problem, not the exporter's. They are logged and counted once per
+file version as `kind="parse"`, and the poll still counts as successful. A file
+that is not valid YAML is treated as unscheduled. A file whose cron cannot be
+evaluated stays watched (state, latest run, last scheduled success) but has no
+interval or grace series. Day-of-week `7` is accepted as Sunday, and YAML
+anchors, aliases and `<<` merge keys are resolved.
+
+If the Actions API lists active workflows under `.github/workflows` but the
+directory itself is "not found", the App most likely lacks **Contents:
+read**. That is treated as an error (`kind="404"`, the poll is not
+successful, and the repo's workflows keep their previous series), with a
+warning logged once per repo. Only when no active workflow points into the
+directory does a 404 mean "no workflow files".
 
 ## Example alerts
 
@@ -199,15 +214,20 @@ successful.
 ```
 
 The Stale rule needs no per-workflow windows: a daily cron gets
-`1.5 × 24h + 1h`, a weekly one `1.5 × 7d + 1h`, a `0 0 1,15 * *` cron
-`1.5 × 14d + 1h`.
+`1.5 × 24h + 1h`, a weekly one `1.5 × 7d + 1h`, a weekdays-only
+`0 9 * * 1-5` cron `1.5 × 72h + 1h`, and a `0 0 1,15 * *` cron
+`1.5 × 17d + 1h`.
 
 ## API budget
 
-GitHub App installations get at least 5,000 requests per hour. With ETags a
-warm poll is roughly one `304` per repo listing plus one per watched workflow,
-and 304s are not charged. A cold start fetches each workflow file once. Each
-poll logs `requests` and `not_modified` counts.
+GitHub App installations get at least 5,000 requests per hour. A poll makes
+one request per 100 repositories, two per repository (the workflow listing
+and the `.github/workflows` directory listing), and at least one per watched
+workflow (its runs; more pages only while searching for a success). Every one
+is ETag-revalidated, so on a quiet poll they are almost all `304`s, which are
+not charged. A cold start also fetches each workflow file once; after that a
+file is fetched again only when its blob SHA changes. Each poll logs
+`requests` and `not_modified` counts.
 
 ## License
 

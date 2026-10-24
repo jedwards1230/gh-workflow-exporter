@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// TestParseSchedulesPrefersOnKey: with both a literal `on` and a YAML 1.1
+// `true` key, `on` wins every time regardless of map iteration order.
+func TestParseSchedulesPrefersOnKey(t *testing.T) {
+	doc := []byte("true:\n  schedule:\n    - cron: '1 1 * * *'\non:\n  schedule:\n    - cron: '2 2 * * *'\n")
+	for range 50 {
+		got, err := parseSchedules(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, []string{"2 2 * * *"}) {
+			t.Fatalf("got %q, want the `on` key's cron", got)
+		}
+	}
+}
+
 func TestParseSchedules(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -23,6 +38,21 @@ func TestParseSchedules(t *testing.T) {
 		{name: "empty schedule", yaml: "on:\n  schedule:\n"},
 		{name: "empty file", yaml: ""},
 		{name: "no on", yaml: "name: x\njobs: {}\n"},
+		{
+			name: "anchor and alias",
+			yaml: "x-crons: &nightly\n  - cron: '0 3 * * *'\non:\n  schedule: *nightly\n",
+			want: []string{"0 3 * * *"},
+		},
+		{
+			name: "merge key",
+			yaml: "x-on: &base\n  schedule:\n    - cron: '0 6 * * 1'\non:\n  <<: *base\n  push: {}\n",
+			want: []string{"0 6 * * 1"},
+		},
+		{
+			name: "aliased cron scalar",
+			yaml: "x: &c '15 2 * * *'\non:\n  schedule:\n    - cron: *c\n",
+			want: []string{"15 2 * * *"},
+		},
 		{name: "schedule not a list", yaml: "on:\n  schedule: '0 0 * * *'\n", wantErr: true},
 		{name: "entry without cron", yaml: "on:\n  schedule:\n    - foo: bar\n", wantErr: true},
 		{name: "invalid yaml", yaml: "on: [\n", wantErr: true},
@@ -128,7 +158,7 @@ func TestSelector(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := &selector{repo: "Octo-Org/Nightly", branch: "main", scheduled: tt.scheduled}
+			s := &selector{repo: "Octo-Org/Nightly", runBranch: "main", successBranch: "main", scheduled: tt.scheduled}
 			s.add(tt.runs)
 			if id := idOf(s.latest); id != tt.wantLatest {
 				t.Errorf("latest = %d, want %d", id, tt.wantLatest)
