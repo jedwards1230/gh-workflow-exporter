@@ -526,11 +526,15 @@ const lastSuccessKey = `github_workflow_last_success_timestamp_seconds{branch=ma
 func pagingFixture(t *testing.T, now time.Time, total, successAt int) *fakeGitHub {
 	gh := newFakeGitHub(t)
 	gh.repos = []repository{{FullName: nightly, DefaultBranch: "main"}}
-	gh.workflows[nightly] = []workflow{{ID: 1, Path: ".github/workflows/build.yml", State: "active"}}
+	gh.workflows[nightly] = []workflow{{ID: 1, Path: ".github/workflows/build.yml", State: "active",
+		CreatedAt: pagingCreated(now).Format(time.RFC3339)}}
 	gh.files[nightly] = map[string]string{".github/workflows/build.yml": dailyYAML}
 	gh.runs[1] = pagingRuns(now, 0, total, successAt)
 	return gh
 }
+
+// pagingCreated is the fixture workflow's created_at, older than every run.
+func pagingCreated(now time.Time) time.Time { return now.Add(-1000 * time.Hour) }
 
 // pagingRuns builds runs with ids/ages offset by start, one hour apart.
 func pagingRuns(now time.Time, start, n, successAt int) []run {
@@ -548,8 +552,8 @@ func pagingRuns(now time.Time, start, n, successAt int) []run {
 func TestRunPaging(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	const (
-		absent = -2 // no last_success series
-		zero   = -1 // series present with value 0
+		absent  = -2 // no last_success series
+		created = -1 // history exhausted: the workflow's created_at
 	)
 	tests := []struct {
 		name        string
@@ -557,16 +561,16 @@ func TestRunPaging(t *testing.T) {
 		successAt   int // -1: no success at all
 		wantShallow int // per_page=10 pages fetched
 		wantDeep    int // per_page=100 pages fetched
-		want        int // index of the success expected, or absent/zero
+		want        int // index of the success expected, or absent/created
 	}{
 		{name: "success on page 1", total: 40, successAt: 3, wantShallow: 1, want: 3},
 		{name: "success on page 3", total: 40, successAt: 22, wantShallow: 3, want: 22},
 		{name: "success on last shallow page", total: 80, successAt: 49, wantShallow: 5, want: 49},
-		{name: "history exhausted on page 1", total: 8, successAt: -1, wantShallow: 1, want: zero},
-		{name: "history exhausted before cap", total: 25, successAt: -1, wantShallow: 3, want: zero},
+		{name: "history exhausted on page 1", total: 8, successAt: -1, wantShallow: 1, want: created},
+		{name: "history exhausted before cap", total: 25, successAt: -1, wantShallow: 3, want: created},
 		{name: "cap hit, deep search finds success", total: 80, successAt: 55, wantShallow: 5, wantDeep: 1, want: 55},
 		{name: "cap hit, deep search finds success on page 3", total: 400, successAt: 250, wantShallow: 5, wantDeep: 3, want: 250},
-		{name: "cap hit, deep history exhausted", total: 120, successAt: -1, wantShallow: 5, wantDeep: 2, want: zero},
+		{name: "cap hit, deep history exhausted", total: 120, successAt: -1, wantShallow: 5, wantDeep: 2, want: created},
 		{name: "cap hit, deep search capped", total: 600, successAt: 550, wantShallow: 5, wantDeep: 5, want: absent},
 	}
 	for _, tt := range tests {
@@ -589,9 +593,9 @@ func TestRunPaging(t *testing.T) {
 				if present {
 					t.Errorf("last_success = %v, want no series", got)
 				}
-			case zero:
-				if !present || got != 0 {
-					t.Errorf("last_success = %v (present %v), want 0", got, present)
+			case created:
+				if want := float64(pagingCreated(now).Unix()); !present || got != want {
+					t.Errorf("last_success = %v (present %v), want created_at %v", got, present, want)
 				}
 			default:
 				want := float64(now.Add(-time.Duration(tt.want+1) * time.Hour).Unix())
@@ -1257,5 +1261,106 @@ func TestLogsNeverContainSecrets(t *testing.T) {
 		if strings.Contains(logs, secret) {
 			t.Errorf("logs contain secret material %q", secret)
 		}
+	}
+}
+
+// TestLastSuccessOnExhaustedHistory: what last_success reports when the run
+// history holds no qualifying success.
+func TestLastSuccessOnExhaustedHistory(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	const deployKey = `github_workflow_last_success_timestamp_seconds{branch=main,repo=octo-org/nightly,workflow=deploy.yml}`
+	createdAt := pagingCreated(now)
+	tests := []struct {
+		name string
+		// setup builds the fixture; prime, if set, runs a first poll and then
+		// mutates the fixture before the poll under test.
+		setup  func(t *testing.T) (*fakeGitHub, string)
+		prime  func(gh *fakeGitHub)
+		key    string
+		want   float64
+		absent bool
+	}{
+		{
+			name:  "scheduled, no success ever: created_at",
+			setup: func(t *testing.T) (*fakeGitHub, string) { return pagingFixture(t, now, 25, -1), "" },
+			key:   lastSuccessKey,
+			want:  float64(createdAt.Unix()),
+		},
+		{
+			name:  "scheduled, known earlier success wins over created_at",
+			setup: func(t *testing.T) (*fakeGitHub, string) { return pagingFixture(t, now, 25, 20), "" },
+			prime: func(gh *fakeGitHub) {
+				// The success's run is deleted: the history is exhausted
+				// without one, but the known success stands.
+				gh.runs[1] = pagingRuns(now, 0, 20, -1)
+			},
+			key:  lastSuccessKey,
+			want: float64(now.Add(-21 * time.Hour).Unix()),
+		},
+		{
+			name:   "deep search capped, nothing known: absent",
+			setup:  func(t *testing.T) (*fakeGitHub, string) { return pagingFixture(t, now, 600, -1), "" },
+			key:    lastSuccessKey,
+			absent: true,
+		},
+		{
+			name: "include-list, no success ever: 0",
+			setup: func(t *testing.T) (*fakeGitHub, string) {
+				gh := newFakeGitHub(t)
+				gh.repos = []repository{{FullName: nightly, DefaultBranch: "main"}}
+				gh.workflows[nightly] = []workflow{{ID: 3, Path: ".github/workflows/deploy.yml", State: "active",
+					CreatedAt: createdAt.Format(time.RFC3339)}}
+				gh.files[nightly] = map[string]string{".github/workflows/deploy.yml": deployYAML}
+				gh.runs[3] = []run{ghRun(nightly, 301, now.Add(-time.Hour), "push", "failure")}
+				return gh, standardConfig
+			},
+			key:  deployKey,
+			want: 0,
+		},
+		{
+			name: "scheduled, created_at missing: 0",
+			setup: func(t *testing.T) (*fakeGitHub, string) {
+				gh := pagingFixture(t, now, 25, -1)
+				gh.workflows[nightly][0].CreatedAt = ""
+				return gh, ""
+			},
+			key:  lastSuccessKey,
+			want: 0,
+		},
+		{
+			name: "scheduled, created_at unparsable: 0",
+			setup: func(t *testing.T) (*fakeGitHub, string) {
+				gh := pagingFixture(t, now, 25, -1)
+				gh.workflows[nightly][0].CreatedAt = "last tuesday"
+				return gh, ""
+			},
+			key:  lastSuccessKey,
+			want: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gh, cfg := tt.setup(t)
+			h := newHarness(t, gh, cfg)
+			ctx := context.Background()
+			if tt.prime != nil {
+				if err := h.c.Poll(ctx); err != nil {
+					t.Fatal(err)
+				}
+				gh.mu.Lock()
+				tt.prime(gh)
+				gh.mu.Unlock()
+			}
+			if err := h.c.Poll(ctx); err != nil {
+				t.Fatal(err)
+			}
+			got, present := h.series(t)[tt.key]
+			switch {
+			case tt.absent && present:
+				t.Errorf("last_success = %v, want no series", got)
+			case !tt.absent && (!present || got != tt.want):
+				t.Errorf("last_success = %v (present %v), want %v", got, present, tt.want)
+			}
+		})
 	}
 }

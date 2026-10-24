@@ -263,9 +263,19 @@ type repository struct {
 }
 
 type workflow struct {
-	ID    int64  `json:"id"`
-	Path  string `json:"path"`
-	State string `json:"state"`
+	ID        int64  `json:"id"`
+	Path      string `json:"path"`
+	State     string `json:"state"`
+	CreatedAt string `json:"created_at"`
+}
+
+// created parses the workflow's created_at; zero if missing or malformed.
+func (wf workflow) created() time.Time {
+	t, err := time.Parse(time.RFC3339, wf.CreatedAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func (c *Collector) listRepos(ctx context.Context) ([]repository, error) {
@@ -369,7 +379,7 @@ func (c *Collector) pollRepo(p *poll, r repository) {
 			st.observed = true
 		}
 		if st.observed {
-			c.emit(st, wf.State, scheduled, sched)
+			c.emit(st, wf, scheduled, sched)
 		}
 	}
 }
@@ -617,7 +627,8 @@ func (c *Collector) fetchRuns(ctx context.Context, first, repo string, sel *sele
 }
 
 // emit writes a workflow's series, replacing any label set that changed.
-func (c *Collector) emit(st *workflowState, state string, scheduled bool, sched *schedule) {
+func (c *Collector) emit(st *workflowState, wf workflow, scheduled bool, sched *schedule) {
+	state := wf.State
 	m := c.m
 	// Gather takes the read side, so a scrape never sees both the old and
 	// the new label set of a swapped series.
@@ -643,8 +654,17 @@ func (c *Collector) emit(st *workflowState, state string, scheduled bool, sched 
 	case st.successUnknown:
 		m.lastSuccess.DeleteLabelValues(st.repo, st.workflow, st.successBranch)
 	default:
-		// History exhausted without a qualifying success: never succeeded.
-		m.lastSuccess.WithLabelValues(st.repo, st.workflow, st.successBranch).Set(0)
+		// History exhausted without a qualifying success. A scheduled
+		// workflow reports its creation time instead of 0: one that has not
+		// reached its first scheduled fire yet gets grace × interval before
+		// Stale fires, and one that never works still alerts after that.
+		// Include-list workflows (no Stale semantics) and a missing or
+		// malformed created_at report 0.
+		var v float64
+		if created := wf.created(); scheduled && !created.IsZero() {
+			v = float64(created.Unix())
+		}
+		m.lastSuccess.WithLabelValues(st.repo, st.workflow, st.successBranch).Set(v)
 	}
 
 	if scheduled && sched.interval > 0 {
