@@ -43,7 +43,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			"Always 1; carries the URL of the latest completed run.",
 			"repo", "workflow", "run_url"),
 		lastSuccess: gv("github_workflow_last_success_timestamp_seconds",
-			"Creation time of the last successful run that counts (scheduled workflows: event=schedule on the default branch); 0 if the run history holds none; absent if the search was capped.",
+			"Creation time of the last successful run that counts (scheduled workflows: event=schedule on the default branch). If the whole run history holds none: the workflow's creation time for scheduled workflows, 0 for include-list ones. Absent if the search was capped with nothing known.",
 			"repo", "workflow", "branch"),
 		expectedInterval: gv("github_workflow_expected_interval_seconds",
 			"Longest gap in seconds between consecutive scheduled fires across all of the workflow's cron entries.",

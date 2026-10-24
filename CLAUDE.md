@@ -30,9 +30,11 @@ as a stable API.
   `_state` series per workflow; a workflow that stops being watched loses
   every series. A failed request never deletes series: only positive evidence
   (listing succeeded and the thing is gone) does.
-- `last_success` semantics: a value when found (or previously seen), `0` only
-  when the run history was exhausted, and *no series* when the search was
-  capped with nothing known. Never emit `0` for "didn't look far enough".
+- `last_success` semantics: a real success when found (or previously seen;
+  it always wins). When the run history was exhausted without one: the
+  workflow's `created_at` for scheduled workflows, `0` for include-list ones
+  (or when `created_at` is missing). *No series* when the search was capped
+  with nothing known. Never emit a value for "didn't look far enough".
 - A scheduled workflow's last success is always `event=schedule` on the
   default branch; a `branch` override moves only `last_run_*`.
 - Per-workflow series are written under `metrics.mu`; Gather reads under its
