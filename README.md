@@ -49,8 +49,13 @@ an override sets `branch`.
   not this one, and a manual or push success says nothing about the
   schedule. For include-list workflows, the newest `success` of any event on
   the tracked branch.
-- If the history runs out without a qualifying success, the last success is
-  `0` (never succeeded). If the 50-run search hits its cap first (for
+- If the history runs out without a qualifying success, a scheduled
+  workflow reports its own creation time (`created_at`) as the last
+  success. A workflow that has not reached its first scheduled fire yet gets
+  `grace × interval` before Stale fires, and one that never succeeds still
+  alerts once that window passes. Include-list workflows report `0`, as does
+  a workflow whose `created_at` is missing or malformed. A real success,
+  once seen, always wins. If the 50-run search hits its cap first (for
   example right after a restart, since state is in memory, or when more than
   50 other runs landed since the last poll), a deep search covers the newest
   500 runs. A previously seen success is always kept. If the deep search is
@@ -147,7 +152,7 @@ Every key is optional. Unknown keys are rejected. See
 | `github_workflow_last_run_conclusion` | `repo`, `workflow`, `branch`, `event`, `conclusion` | `1` for the latest completed run on the tracked branch (any event). Exactly one series per workflow: the old one is deleted when a label changes. |
 | `github_workflow_last_run_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of that run |
 | `github_workflow_last_run_url_info` | `repo`, `workflow`, `run_url` | `1`; the URL of that run, for alert links |
-| `github_workflow_last_success_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of the last success that counts (scheduled workflows: `event=schedule` on the default branch, which is the `branch` label). `0` when the whole run history was searched without one, so a never-succeeded workflow is stale. **Absent** when the history is longer than the search cap (the newest 500 runs) and no success was found in it. |
+| `github_workflow_last_success_timestamp_seconds` | `repo`, `workflow`, `branch` | Creation time of the last success that counts (scheduled workflows: `event=schedule` on the default branch, which is the `branch` label). When the whole run history was searched without one: the workflow's `created_at` for scheduled workflows (so a never-succeeded one goes stale `grace × interval` after it was created), `0` for include-list workflows. **Absent** when the history is longer than the search cap (the newest 500 runs) and no success was found in it. |
 | `github_workflow_expected_interval_seconds` | `repo`, `workflow` | Longest gap in seconds between consecutive scheduled fires across all of the workflow's cron entries (their merged fire sequence, in UTC), at least 300 (GitHub's minimum schedule interval). A weekdays-only cron gets 72h, so a weekend is never stale. Scheduled workflows only, and absent if a cron cannot be evaluated. |
 | `github_workflow_grace_factor` | `repo`, `workflow` | Effective grace factor. Scheduled workflows only. |
 | `github_workflow_state` | `repo`, `workflow`, `state` | `1` for the current state: `active`, `disabled_inactivity`, `disabled_manually`, … |
