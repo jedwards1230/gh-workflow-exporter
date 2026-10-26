@@ -7,7 +7,7 @@ ARG VERSION=docker
 ARG COMMIT=unknown
 ARG DATE=
 
-FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27 AS builder
 ARG VERSION
 ARG COMMIT
 ARG DATE
