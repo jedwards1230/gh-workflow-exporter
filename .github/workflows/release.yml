@@ -209,7 +209,7 @@ jobs:
     name: Tag & Generate Notes
     needs: [detect]
     if: needs.detect.outputs.release == 'true'
-    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@b185a6e7822f9c36822ed8e89e77b3d0fe229f96 # v1.12.0
+    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@9f6e82e1035f04e19bce5c78bbd750edac3b6ff5 # v1.13.2
     with:
       service_name: gh-workflow-exporter
       service_description: "a Prometheus exporter for GitHub Actions workflow health (last run, staleness, disabled state)"
