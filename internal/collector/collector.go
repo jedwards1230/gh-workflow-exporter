@@ -57,6 +57,9 @@ type Collector struct {
 	// warnedNoContents records repos already reported as listing workflows
 	// but hiding their workflow directory (missing Contents permission).
 	warnedNoContents map[string]bool
+	// repoErrors maps the lower-cased name of every repo with
+	// gh_exporter_repo_poll_errors_total series to its label value.
+	repoErrors map[string]string
 }
 
 // schedule is the parsed `on.schedule` of one workflow file version.
@@ -107,6 +110,7 @@ func New(api API, cfg *config.Config, log *slog.Logger, reg prometheus.Registere
 		warned:  map[string]bool{},
 
 		warnedNoContents: map[string]bool{},
+		repoErrors:       map[string]string{},
 	}
 }
 
@@ -114,7 +118,7 @@ func New(api API, cfg *config.Config, log *slog.Logger, reg prometheus.Registere
 // github.Options.OnRateLimit.
 func (c *Collector) SetRateLimitRemaining(v float64) { c.m.rateLimitRemaining.Set(v) }
 
-// Ready reports whether a poll has completed without errors.
+// Ready reports whether a poll has succeeded (see Poll).
 func (c *Collector) Ready() bool { return c.ready.Load() }
 
 // Run polls immediately and then every poll interval until ctx is done.
@@ -139,6 +143,16 @@ type poll struct {
 	ctx      context.Context
 	parent   context.Context
 	failures int
+	// global is set by a failure that is not one repo's own: discovery,
+	// auth, the poll deadline, or shutdown. It makes the poll unsuccessful.
+	global bool
+	// repo is the repository being polled, "" outside pollRepo; failures
+	// while it is set are attributed to it.
+	repo string
+	// polled counts repos pollRepo ran for; failedRepos holds those of them
+	// with at least one failure.
+	polled      int
+	failedRepos map[string]bool
 	// overran is set once the per-poll deadline has been counted.
 	overran bool
 	seen    map[string]bool
@@ -146,15 +160,19 @@ type poll struct {
 	shas    map[string]bool // parsed-cache entries still in use
 }
 
-// fail counts and logs an error that makes this poll unsuccessful. Errors
-// caused by shutdown (the parent context ending) are not counted; a poll that
-// overruns its own deadline is, as kind "network".
+// fail counts and logs an error. Errors caused by shutdown (the parent
+// context ending) are not counted; a poll that overruns its own deadline is,
+// as kind "network". Shutdown, the deadline, auth failures and errors outside
+// a repo are global and make the poll unsuccessful; any other error is
+// attributed to the repo being polled (see Poll).
 func (c *Collector) fail(p *poll, err error, msg string, attrs ...any) {
 	p.failures++
 	if p.parent.Err() != nil {
+		p.global = true
 		return
 	}
 	if p.ctx.Err() != nil {
+		p.global = true
 		// Past the deadline every remaining request fails the same way:
 		// count and log the overrun once, not once per request.
 		if !p.overran {
@@ -165,8 +183,16 @@ func (c *Collector) fail(p *poll, err error, msg string, attrs ...any) {
 		}
 		return
 	}
-	c.m.pollErrors.WithLabelValues(github.KindOf(err)).Inc()
-	c.log.Warn(msg, append(attrs, "kind", github.KindOf(err), "err", err)...)
+	kind := github.KindOf(err)
+	c.m.pollErrors.WithLabelValues(kind).Inc()
+	if p.repo != "" && kind != github.KindAuth {
+		p.failedRepos[p.repo] = true
+		c.m.repoPollErrors.WithLabelValues(p.repo, kind).Inc()
+		c.repoErrors[strings.ToLower(p.repo)] = p.repo
+	} else {
+		p.global = true
+	}
+	c.log.Warn(msg, append(attrs, "kind", kind, "err", err)...)
 }
 
 // expired reports whether the poll is out of time (deadline or shutdown),
@@ -180,9 +206,15 @@ func (c *Collector) expired(p *poll) bool {
 }
 
 // Poll runs one discovery-and-collect pass. It returns an error if any
-// request failed; partial results are still exported, but the poll does not
-// count as successful (gh_exporter_last_poll_success_timestamp_seconds and
-// readiness are untouched).
+// request failed; partial results are still exported either way.
+//
+// The poll counts as successful (gh_exporter_last_poll_success_timestamp_seconds
+// and readiness advance) unless a global failure occurred (see fail) or every
+// polled repo failed. One repo that cannot be read must not blind the
+// exporter: its errors are counted in gh_exporter_repo_poll_errors_total and
+// its workflows keep their previous series, while the rest stay fresh. When
+// every repo fails, the cause is almost certainly the exporter's (a GitHub
+// outage, an exhausted rate limit), so the poll fails.
 //
 // Each poll is bounded by the poll interval.
 func (c *Collector) Poll(parent context.Context) error {
@@ -195,7 +227,8 @@ func (c *Collector) Poll(parent context.Context) error {
 	defer cancel()
 	c.api.BeginPoll()
 	defer c.api.EndPoll()
-	p := &poll{ctx: ctx, parent: parent, seen: map[string]bool{}, matched: map[string]bool{}, shas: map[string]bool{}}
+	p := &poll{ctx: ctx, parent: parent, failedRepos: map[string]bool{},
+		seen: map[string]bool{}, matched: map[string]bool{}, shas: map[string]bool{}}
 
 	repos, err := c.listRepos(ctx)
 	if err != nil {
@@ -218,6 +251,12 @@ func (c *Collector) Poll(parent context.Context) error {
 		for k := range c.files {
 			if !visible[k] {
 				delete(c.files, k)
+			}
+		}
+		for k, repo := range c.repoErrors {
+			if !visible[k] {
+				c.m.repoPollErrors.DeletePartialMatch(prometheus.Labels{"repo": repo})
+				delete(c.repoErrors, k)
 			}
 		}
 		c.m.mu.Lock()
@@ -246,13 +285,16 @@ func (c *Collector) Poll(parent context.Context) error {
 		"requests", stats.Requests,
 		"not_modified", stats.NotModified,
 		"errors", p.failures,
+		"failed_repos", len(p.failedRepos),
 		"watched", len(c.watched),
 		"duration", c.now().Sub(start).Round(time.Millisecond).String())
-	if p.failures > 0 {
-		return fmt.Errorf("poll finished with %d errors", p.failures)
+	if !p.global && (p.polled == 0 || len(p.failedRepos) < p.polled) {
+		c.m.lastPollSuccess.Set(float64(c.now().UnixNano()) / 1e9)
+		c.ready.Store(true)
 	}
-	c.m.lastPollSuccess.Set(float64(c.now().UnixNano()) / 1e9)
-	c.ready.Store(true)
+	if p.failures > 0 {
+		return fmt.Errorf("poll finished with %d errors in %d repos", p.failures, len(p.failedRepos))
+	}
 	return nil
 }
 
@@ -314,6 +356,9 @@ func (c *Collector) carryOver(p *poll, repo string) {
 
 func (c *Collector) pollRepo(p *poll, r repository) {
 	ctx := p.ctx
+	p.polled++
+	p.repo = r.FullName
+	defer func() { p.repo = "" }()
 	workflows, err := c.listWorkflows(ctx, r.FullName)
 	if err != nil {
 		c.fail(p, err, "listing workflows", "repo", r.FullName)
@@ -432,10 +477,28 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 		}
 		if github.IsNotFound(err) {
 			// Active workflows live under .github/workflows, yet the
-			// directory is "not found": almost always the App lacks
-			// Contents: read and GitHub hides it. That is an error, not an
-			// empty directory: keep the previous file set so the workflows
-			// keep their series, and fail the poll.
+			// directory is "not found". Either it really is absent from the
+			// default branch (a workflow registered from another branch,
+			// e.g. a repo's first workflow arriving in a PR), or the App
+			// lacks Contents: read and GitHub hides it. The repo root tells
+			// them apart: it is readable exactly when the App has the
+			// permission.
+			probeErr := c.probeContents(p.ctx, r)
+			if probeErr == nil {
+				c.log.Debug("no workflow directory on the default branch; workflows listed from other branches are unscheduled",
+					"repo", r.FullName, "branch", r.DefaultBranch)
+				delete(c.warnedNoContents, key)
+				c.files[key] = map[string]string{}
+				return c.files[key]
+			}
+			if !github.IsNotFound(probeErr) {
+				// The probe itself failed (5xx, network): nothing is known.
+				c.fail(p, probeErr, "probing repository contents", "repo", r.FullName)
+				return c.files[key]
+			}
+			// The root is hidden too: no permission. That is an error, not
+			// an empty directory: keep the previous file set so the
+			// workflows keep their series, and count the failure.
 			if !c.warnedNoContents[key] {
 				c.warnedNoContents[key] = true
 				c.log.Warn("workflow directory not readable on the default branch; does the App have Contents: read?",
@@ -466,6 +529,13 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 	}
 	c.files[key] = files
 	return files
+}
+
+// probeContents lists the repo root on the default branch; nil means the App
+// can read the repo's contents.
+func (c *Collector) probeContents(ctx context.Context, r repository) error {
+	_, err := c.api.Get(ctx, repoPath(r.FullName)+"/contents?ref="+url.QueryEscape(r.DefaultBranch))
+	return err
 }
 
 // hasActiveFileWorkflow reports whether an active workflow is defined by a

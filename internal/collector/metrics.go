@@ -25,6 +25,7 @@ type metrics struct {
 	lastPollSuccess    prometheus.Gauge
 	rateLimitRemaining prometheus.Gauge
 	pollErrors         *prometheus.CounterVec
+	repoPollErrors     *prometheus.CounterVec
 	watched            prometheus.Gauge
 }
 
@@ -56,7 +57,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			"repo", "workflow", "state"),
 		lastPollSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gh_exporter_last_poll_success_timestamp_seconds",
-			Help: "Unix time at the end of the last poll that completed without errors.",
+			Help: "Unix time at the end of the last successful poll: discovery and auth worked, the poll finished in time, and at least one repository (if any) was polled without errors.",
 		}),
 		rateLimitRemaining: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gh_exporter_rate_limit_remaining",
@@ -66,6 +67,10 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "gh_exporter_poll_errors_total",
 			Help: "Errors met while polling GitHub, by kind.",
 		}, []string{"kind"}),
+		repoPollErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gh_exporter_repo_poll_errors_total",
+			Help: "Errors met while polling one repository, by kind. Created at a repository's first error; deleted when the repository is no longer visible.",
+		}, []string{"repo", "kind"}),
 		watched: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gh_exporter_watched_workflows",
 			Help: "Number of workflows currently watched.",
@@ -74,7 +79,7 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 	for _, v := range m.perWorkflow() {
 		reg.MustRegister(locked{mu: &m.mu, c: v})
 	}
-	reg.MustRegister(m.lastPollSuccess, m.rateLimitRemaining, m.pollErrors, m.watched)
+	reg.MustRegister(m.lastPollSuccess, m.rateLimitRemaining, m.pollErrors, m.repoPollErrors, m.watched)
 	for _, k := range github.Kinds {
 		m.pollErrors.WithLabelValues(k)
 	}

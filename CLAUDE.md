@@ -39,7 +39,12 @@ as a stable API.
   default branch; a `branch` override moves only `last_run_*`.
 - Per-workflow series are written under `metrics.mu`; Gather reads under its
   read lock, so a label swap is atomic to scrapes.
-- A poll with any API error does not advance
-  `gh_exporter_last_poll_success_timestamp_seconds` or readiness.
+- A repo's own errors never block
+  `gh_exporter_last_poll_success_timestamp_seconds` or readiness; they go to
+  `gh_exporter_repo_poll_errors_total`. Only global failures (discovery,
+  auth, deadline) or every polled repo failing do.
+- A 404 on `.github/workflows` with active workflows is "absent" when the
+  repo root is readable, and a missing-Contents-permission error only when
+  the root 404s too.
 - Never log the private key or the installation token.
 - Public repo: examples use neutral names (`octo-org/...`).

@@ -113,7 +113,7 @@ Run a single replica: the exporter keeps its observations in memory.
 |---|---|
 | `/metrics` | Prometheus metrics |
 | `/healthz` | Liveness: `200` while the process is serving |
-| `/readyz` | `200` once a poll has completed without errors, `503` before |
+| `/readyz` | `200` once a poll has succeeded (see [Errors and poll success](#metrics)), `503` before |
 
 ### Flags and environment
 
@@ -156,9 +156,10 @@ Every key is optional. Unknown keys are rejected. See
 | `github_workflow_expected_interval_seconds` | `repo`, `workflow` | Longest gap in seconds between consecutive scheduled fires across all of the workflow's cron entries (their merged fire sequence, in UTC), at least 300 (GitHub's minimum schedule interval). A weekdays-only cron gets 72h, so a weekend is never stale. Scheduled workflows only, and absent if a cron cannot be evaluated. |
 | `github_workflow_grace_factor` | `repo`, `workflow` | Effective grace factor. Scheduled workflows only. |
 | `github_workflow_state` | `repo`, `workflow`, `state` | `1` for the current state: `active`, `disabled_inactivity`, `disabled_manually`, … |
-| `gh_exporter_last_poll_success_timestamp_seconds` | — | End of the last poll that completed without errors |
+| `gh_exporter_last_poll_success_timestamp_seconds` | — | End of the last successful poll (see below): not advanced by one repo's errors, only by global ones or by every repo failing |
 | `gh_exporter_rate_limit_remaining` | — | Last `x-ratelimit-remaining` seen (`0` until the first API response) |
 | `gh_exporter_poll_errors_total` | `kind` | Errors by kind: `403` (also 429 and other 4xx refusals), `404`, `5xx`, `parse`, `network`, `auth` |
+| `gh_exporter_repo_poll_errors_total` | `repo`, `kind` | Errors met while polling one repo (same kinds as above, `auth` excepted). Created at the repo's first error; deleted once the repo is no longer visible to the App |
 | `gh_exporter_watched_workflows` | — | Number of watched workflows |
 
 All series of a workflow are deleted when it stops being watched: removed
@@ -167,11 +168,17 @@ longer visible to the App. A failed request never deletes series. The
 workflow keeps its last values until a later poll shows it is really gone.
 
 **Errors and poll success.** One repo or workflow failing does not abort the
-poll: the rest is still collected and exported. But any API, network, auth or
-response-decoding error marks the poll unsuccessful, so
+poll: the rest is still collected and exported, and the failing repo's
+workflows keep their previous series. An error inside a repo is that repo's:
+it is counted in `gh_exporter_repo_poll_errors_total` as well as
+`gh_exporter_poll_errors_total`, and does not stop the poll from counting as
+successful. The poll is unsuccessful, so
 `gh_exporter_last_poll_success_timestamp_seconds` and readiness do not
-advance. A poll that overruns `poll_interval` is cut off and counted as
-`network`. Problems in a workflow file are different: they are the
+advance, on a global failure (the installation's repository listing failing,
+any `auth` error, the poll overrunning `poll_interval`, which is cut off and
+counted as `network`) or when **every** polled repo failed (a GitHub outage
+or an exhausted rate limit looks like that). Alert on a single stuck repo
+with the per-repo counter. Problems in a workflow file are different: they are the
 repository's problem, not the exporter's. They are logged and counted once per
 file version as `kind="parse"`, and the poll still counts as successful. A file
 that is not valid YAML is treated as unscheduled. A file whose cron cannot be
@@ -180,11 +187,14 @@ interval or grace series. Day-of-week `7` is accepted as Sunday, and YAML
 anchors, aliases and `<<` merge keys are resolved.
 
 If the Actions API lists active workflows under `.github/workflows` but the
-directory itself is "not found", the App most likely lacks **Contents:
-read**. That is treated as an error (`kind="404"`, the poll is not
-successful, and the repo's workflows keep their previous series), with a
-warning logged once per repo. Only when no active workflow points into the
-directory does a 404 mean "no workflow files".
+directory is "not found" on the default branch, the exporter lists the repo
+root to tell two cases apart. Root readable: the directory really is absent
+there (a workflow registered from another branch, such as a repo's first
+workflow arriving in a pull request), so nothing is scheduled and no error is
+counted. Root hidden too: the App lacks **Contents: read**. That is a repo
+error (`kind="404"`, the repo's workflows keep their previous series), with a
+warning logged once per repo. When no active workflow points into the
+directory, a 404 means "no workflow files" without the probe.
 
 ## Example alerts
 
@@ -216,6 +226,12 @@ directory does a 404 mean "no workflow files".
       or absent(up{job="gh-workflow-exporter"})
       or time() - gh_exporter_last_poll_success_timestamp_seconds > 1800
   for: 15m
+
+# One repo keeps failing (e.g. the App lost Contents: read on it) while the
+# rest of the installation is polled fine.
+- alert: GitHubWorkflowExporterRepoFailing
+  expr: sum by (repo) (increase(gh_exporter_repo_poll_errors_total[15m])) > 0
+  for: 30m
 ```
 
 The Stale rule needs no per-workflow windows: a daily cron gets
@@ -227,7 +243,8 @@ The Stale rule needs no per-workflow windows: a daily cron gets
 
 GitHub App installations get at least 5,000 requests per hour. A poll makes
 one request per 100 repositories, two per repository (the workflow listing
-and the `.github/workflows` directory listing), and at least one per watched
+and the `.github/workflows` directory listing; a third, the root listing,
+when that directory is missing on the default branch), and at least one per watched
 workflow (its runs; more pages only while searching for a success). Every one
 is ETag-revalidated, so on a quiet poll they are almost all `304`s, which are
 not charged. A cold start also fetches each workflow file once; after that a
