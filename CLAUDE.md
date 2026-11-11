@@ -42,8 +42,8 @@ as a stable API.
 - A repo's own errors never block
   `gh_exporter_last_poll_success_timestamp_seconds` or readiness; they go to
   `gh_exporter_repo_poll_errors_total`. Only global failures (discovery,
-  auth, deadline) or every polled repo failing do.
-- A 404 on `.github/workflows` with active workflows is "absent" when the
+  auth, token mint, rate limiting, deadline) or every polled repo failing do.
+- A 404 on `.github/workflows` (active or disabled workflows) is "absent" when the
   repo root is readable, and a missing-Contents-permission error only when
   the root 404s too.
 - Never log the private key or the installation token.

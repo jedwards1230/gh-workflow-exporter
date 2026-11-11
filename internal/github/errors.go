@@ -25,6 +25,10 @@ type Error struct {
 	Status int // HTTP status, 0 if no response
 	Op     string
 	Err    error
+	// RateLimited marks a throttled request (429, or a 403 carrying
+	// x-ratelimit-remaining: 0 or Retry-After). The kind stays "403" so the
+	// metric's label set is unchanged.
+	RateLimited bool
 	// mint marks failures of the token mint itself, which a 401 retry must
 	// not repeat.
 	mint bool
@@ -52,6 +56,32 @@ func KindOf(err error) string {
 func IsNotFound(err error) bool {
 	var e *Error
 	return errors.As(err, &e) && e.Kind == KindNotFound
+}
+
+// IsRateLimited reports whether err is GitHub throttling the installation.
+func IsRateLimited(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.RateLimited
+}
+
+// IsMint reports whether err is a failure to mint the installation token,
+// which concerns every request, not the one that triggered it.
+func IsMint(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.mint
+}
+
+// rateLimited reports whether a refused response is GitHub throttling:
+// 429, or a 403 for an exhausted primary limit (x-ratelimit-remaining: 0) or
+// a secondary limit (Retry-After).
+func rateLimited(status int, h http.Header) bool {
+	switch status {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusForbidden:
+		return h.Get("X-RateLimit-Remaining") == "0" || h.Get("Retry-After") != ""
+	}
+	return false
 }
 
 // kindForStatus maps an unexpected HTTP status to an error kind. The metric's

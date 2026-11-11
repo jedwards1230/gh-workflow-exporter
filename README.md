@@ -159,7 +159,7 @@ Every key is optional. Unknown keys are rejected. See
 | `gh_exporter_last_poll_success_timestamp_seconds` | — | End of the last successful poll (see below): not advanced by one repo's errors, only by global ones or by every repo failing |
 | `gh_exporter_rate_limit_remaining` | — | Last `x-ratelimit-remaining` seen (`0` until the first API response) |
 | `gh_exporter_poll_errors_total` | `kind` | Errors by kind: `403` (also 429 and other 4xx refusals), `404`, `5xx`, `parse`, `network`, `auth` |
-| `gh_exporter_repo_poll_errors_total` | `repo`, `kind` | Errors met while polling one repo (same kinds as above, `auth` excepted). Created at the repo's first error; deleted once the repo is no longer visible to the App |
+| `gh_exporter_repo_poll_errors_total` | `repo`, `kind` | Errors met while polling one repo (same kinds as above; `auth`, token-mint and rate-limit errors are global and not counted here). Created at the repo's first error; deleted once the repo is no longer visible to the App |
 | `gh_exporter_watched_workflows` | — | Number of watched workflows |
 
 All series of a workflow are deleted when it stops being watched: removed
@@ -175,9 +175,11 @@ it is counted in `gh_exporter_repo_poll_errors_total` as well as
 successful. The poll is unsuccessful, so
 `gh_exporter_last_poll_success_timestamp_seconds` and readiness do not
 advance, on a global failure (the installation's repository listing failing,
-any `auth` error, the poll overrunning `poll_interval`, which is cut off and
-counted as `network`) or when **every** polled repo failed (a GitHub outage
-or an exhausted rate limit looks like that). Alert on a single stuck repo
+any `auth` or token-mint error, rate limiting at any point in the poll — a
+429, or a 403 with `x-ratelimit-remaining: 0` or `Retry-After` — or the poll
+overrunning `poll_interval`, which is cut off and counted as `network`) or
+when **every** polled repo failed (a GitHub outage looks like that). Global
+errors are counted only in `gh_exporter_poll_errors_total`. Alert on a single stuck repo
 with the per-repo counter. Problems in a workflow file are different: they are the
 repository's problem, not the exporter's. They are logged and counted once per
 file version as `kind="parse"`, and the poll still counts as successful. A file
@@ -186,15 +188,15 @@ evaluated stays watched (state, latest run, last scheduled success) but has no
 interval or grace series. Day-of-week `7` is accepted as Sunday, and YAML
 anchors, aliases and `<<` merge keys are resolved.
 
-If the Actions API lists active workflows under `.github/workflows` but the
+If the Actions API lists workflows under `.github/workflows` but the
 directory is "not found" on the default branch, the exporter lists the repo
 root to tell two cases apart. Root readable: the directory really is absent
 there (a workflow registered from another branch, such as a repo's first
 workflow arriving in a pull request), so nothing is scheduled and no error is
 counted. Root hidden too: the App lacks **Contents: read**. That is a repo
 error (`kind="404"`, the repo's workflows keep their previous series), with a
-warning logged once per repo. When no active workflow points into the
-directory, a 404 means "no workflow files" without the probe.
+warning logged once per repo. This holds whether the workflows are active or
+disabled, so a hidden directory never deletes series.
 
 ## Example alerts
 

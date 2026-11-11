@@ -162,8 +162,9 @@ type poll struct {
 
 // fail counts and logs an error. Errors caused by shutdown (the parent
 // context ending) are not counted; a poll that overruns its own deadline is,
-// as kind "network". Shutdown, the deadline, auth failures and errors outside
-// a repo are global and make the poll unsuccessful; any other error is
+// as kind "network". Shutdown, the deadline, auth failures, token-mint
+// failures, rate limiting and errors outside a repo are global and make the
+// poll unsuccessful: none of them is the repo's doing. Any other error is
 // attributed to the repo being polled (see Poll).
 func (c *Collector) fail(p *poll, err error, msg string, attrs ...any) {
 	p.failures++
@@ -185,7 +186,7 @@ func (c *Collector) fail(p *poll, err error, msg string, attrs ...any) {
 	}
 	kind := github.KindOf(err)
 	c.m.pollErrors.WithLabelValues(kind).Inc()
-	if p.repo != "" && kind != github.KindAuth {
+	if p.repo != "" && kind != github.KindAuth && !github.IsRateLimited(err) && !github.IsMint(err) {
 		p.failedRepos[p.repo] = true
 		c.m.repoPollErrors.WithLabelValues(p.repo, kind).Inc()
 		c.repoErrors[strings.ToLower(p.repo)] = p.repo
@@ -469,20 +470,14 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 	u := repoPath(r.FullName) + "/contents/" + workflowDir + "?ref=" + url.QueryEscape(r.DefaultBranch)
 	res, err := c.api.Get(p.ctx, u)
 	if err != nil {
-		if github.IsNotFound(err) && !hasActiveFileWorkflow(workflows) {
-			// Only inactive workflows point into the directory, so it may
-			// really be gone from the default branch: nothing is scheduled.
-			c.files[key] = map[string]string{}
-			return c.files[key]
-		}
 		if github.IsNotFound(err) {
-			// Active workflows live under .github/workflows, yet the
-			// directory is "not found". Either it really is absent from the
-			// default branch (a workflow registered from another branch,
-			// e.g. a repo's first workflow arriving in a PR), or the App
-			// lacks Contents: read and GitHub hides it. The repo root tells
-			// them apart: it is readable exactly when the App has the
-			// permission.
+			// Workflows live under .github/workflows, yet the directory is
+			// "not found". Either it really is absent from the default
+			// branch (a workflow registered from another branch, e.g. a
+			// repo's first workflow arriving in a PR, or one deleted since),
+			// or the App lacks Contents: read and GitHub hides it. The repo
+			// root tells them apart: it is readable exactly when the App has
+			// the permission. Only the former may drop series.
 			probeErr := c.probeContents(p.ctx, r)
 			if probeErr == nil {
 				c.log.Debug("no workflow directory on the default branch; workflows listed from other branches are unscheduled",
@@ -536,17 +531,6 @@ func (c *Collector) workflowFiles(p *poll, r repository, workflows []workflow) m
 func (c *Collector) probeContents(ctx context.Context, r repository) error {
 	_, err := c.api.Get(ctx, repoPath(r.FullName)+"/contents?ref="+url.QueryEscape(r.DefaultBranch))
 	return err
-}
-
-// hasActiveFileWorkflow reports whether an active workflow is defined by a
-// file under workflowDir.
-func hasActiveFileWorkflow(workflows []workflow) bool {
-	for _, wf := range workflows {
-		if wf.State == "active" && strings.HasPrefix(wf.Path, workflowDir+"/") {
-			return true
-		}
-	}
-	return false
 }
 
 // scheduleFor returns the workflow's parsed schedule (nil when it has none)

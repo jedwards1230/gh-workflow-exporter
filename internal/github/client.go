@@ -242,7 +242,8 @@ func (c *Client) getLocked(ctx context.Context, u string) (*Response, error) {
 		entry.gen = c.gen
 		return &Response{Body: entry.body, Next: entry.next, NotModified: true}, nil
 	default:
-		return nil, &Error{Kind: kindForStatus(res.StatusCode), Status: res.StatusCode, Op: op, Err: errors.New(apiMessage(body))}
+		return nil, &Error{Kind: kindForStatus(res.StatusCode), Status: res.StatusCode, Op: op, Err: errors.New(apiMessage(body)),
+			RateLimited: rateLimited(res.StatusCode, res.Header)}
 	}
 }
 

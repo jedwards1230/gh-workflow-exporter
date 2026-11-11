@@ -1472,6 +1472,22 @@ func TestRepoFailuresAndPollSuccess(t *testing.T) {
 			},
 		},
 		{
+			// Throttling is the installation's, not the repos': running out
+			// after the first repo must still fail the poll.
+			name: "rate limit hit mid-poll is global",
+			setup: func(gh *fakeGitHub) {
+				gh.repos = append(gh.repos, repository{FullName: "octo-org/third", DefaultBranch: "main"})
+				gh.fail["/repos/octo-org/fresh/actions/workflows"] = http.StatusTooManyRequests
+				gh.fail["/repos/octo-org/third/actions/workflows"] = http.StatusTooManyRequests
+			},
+			wantErr: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_poll_errors_total{kind=403}`: 2,
+				`gh_exporter_watched_workflows{}`:         2,
+			},
+			absent: []string{`gh_exporter_repo_poll_errors_total`},
+		},
+		{
 			name: "auth failure inside a repo is global",
 			setup: func(gh *fakeGitHub) {
 				gh.fail["/repos/octo-org/fresh/actions/workflows"] = http.StatusUnauthorized
@@ -1551,4 +1567,34 @@ func TestWorkflowDirRemovedFromDefaultBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertAbsent(t, h.series(t), `gh_exporter_repo_poll_errors_total`)
+}
+
+// TestHiddenDirWithOnlyInactiveWorkflows: a directory 404 is probed even when
+// no active workflow points into it, so a missing permission is an error
+// and never deletes the (disabled) workflows' series.
+func TestHiddenDirWithOnlyInactiveWorkflows(t *testing.T) {
+	gh := standardFixture(t, time.Now())
+	h := newHarness(t, gh, standardConfig)
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gh.mu.Lock()
+	for i := range gh.workflows[nightly] {
+		gh.workflows[nightly][i].State = "disabled_manually"
+	}
+	gh.noContents[nightly] = true
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err == nil {
+		t.Fatal("poll succeeded with the workflow directory hidden")
+	}
+	got := h.series(t)
+	assertSeries(t, got, map[string]float64{
+		`github_workflow_state{repo=octo-org/nightly,state=disabled_manually,workflow=build.yml}`: 1,
+		`gh_exporter_repo_poll_errors_total{kind=404,repo=octo-org/nightly}`:                      1,
+		`gh_exporter_watched_workflows{}`:                                                         2,
+	})
+	if n := strings.Count(h.logs.String(), "Contents: read"); n != 1 {
+		t.Errorf("permission hint logged %d times, want 1", n)
+	}
 }

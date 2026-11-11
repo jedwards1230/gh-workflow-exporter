@@ -393,6 +393,53 @@ func TestErrorKinds(t *testing.T) {
 	}
 }
 
+func TestRateLimited(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		header map[string]string
+		want   bool
+	}{
+		{"429", http.StatusTooManyRequests, nil, true},
+		{"primary limit exhausted", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "0"}, true},
+		{"secondary limit", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "4000", "Retry-After": "60"}, true},
+		{"plain 403", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "4000"}, false},
+		{"404", http.StatusNotFound, map[string]string{"X-RateLimit-Remaining": "0"}, false},
+		{"5xx", http.StatusBadGateway, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				for k, v := range tt.header {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(tt.status)
+			})
+			_, err := c.Get(context.Background(), "/x")
+			if got := IsRateLimited(err); got != tt.want {
+				t.Fatalf("IsRateLimited(%v) = %v, want %v", err, got, tt.want)
+			}
+			if IsMint(err) {
+				t.Fatalf("IsMint(%v) = true for an API call", err)
+			}
+		})
+	}
+	t.Run("mint 429", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := New(7, 42, pkcs1PEM(t), Options{BaseURL: srv.URL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Get(context.Background(), "/x")
+		if !IsRateLimited(err) || !IsMint(err) {
+			t.Fatalf("mint 429: IsRateLimited = %v, IsMint = %v, want both", IsRateLimited(err), IsMint(err))
+		}
+	})
+}
+
 func TestOversizedBody(t *testing.T) {
 	big := strings.Repeat("x", maxBody+1)
 	calls := 0
