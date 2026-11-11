@@ -126,7 +126,8 @@ func (c *Client) mintLocked(ctx context.Context, now time.Time) (string, time.Ti
 	// The access_tokens endpoint is billed to the App, not the installation,
 	// so its rate-limit headers are deliberately not recorded.
 	if res.StatusCode != http.StatusCreated && res.StatusCode != http.StatusOK {
-		return "", time.Time{}, &Error{Kind: mintKind(res.StatusCode), Status: res.StatusCode, Op: "minting installation token", Err: errors.New(apiMessage(body)), mint: true}
+		return "", time.Time{}, &Error{Kind: mintKind(res.StatusCode), Status: res.StatusCode, Op: "minting installation token", Err: errors.New(apiMessage(body)),
+			RateLimited: res.StatusCode == http.StatusTooManyRequests, mint: true}
 	}
 	var out struct {
 		Token     string    `json:"token"`

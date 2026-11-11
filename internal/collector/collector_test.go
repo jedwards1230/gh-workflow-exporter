@@ -44,8 +44,11 @@ type fakeGitHub struct {
 	workflows map[string][]workflow        // repo -> workflows
 	files     map[string]map[string]string // repo -> path -> content
 	runs      map[int64][]run              // workflow id -> runs, newest first
-	fail      map[string]int               // URL path -> forced status
-	delay     map[string]time.Duration     // URL path -> response delay
+	// noContents marks repos whose contents the App cannot read (no
+	// Contents: read): every contents request 404s, the root included.
+	noContents map[string]bool
+	fail       map[string]int           // URL path -> forced status
+	delay      map[string]time.Duration // URL path -> response delay
 
 	requests     []*url.URL
 	notModified  int
@@ -59,6 +62,7 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		workflows:    map[string][]workflow{},
 		files:        map[string]map[string]string{},
 		runs:         map[int64][]run{},
+		noContents:   map[string]bool{},
 		fail:         map[string]int{},
 		delay:        map[string]time.Duration{},
 		runPageFetch: map[string]int{},
@@ -131,7 +135,18 @@ func (f *fakeGitHub) route(r *http.Request) (any, string, int) {
 		return nil, "", http.StatusNotFound
 	}
 	repo, tail := parts[0]+"/"+parts[1], parts[2]
+	if f.noContents[repo] && (tail == "contents" || strings.HasPrefix(tail, "contents/")) {
+		return nil, "", http.StatusNotFound
+	}
 	switch {
+	case tail == "contents":
+		// The repo root: readable for any repo the fake knows.
+		for _, r := range f.repos {
+			if r.FullName == repo {
+				return []map[string]string{{"path": "README.md", "sha": blobSHA(repo), "type": "file"}}, "", http.StatusOK
+			}
+		}
+		return nil, "", http.StatusNotFound
 	case tail == "actions/workflows":
 		return map[string]any{"total_count": len(f.workflows[repo]), "workflows": f.workflows[repo]}, "", http.StatusOK
 	case tail == "contents/.github/workflows":
@@ -838,8 +853,8 @@ func TestPollErrors(t *testing.T) {
 	okAt := before[`gh_exporter_last_poll_success_timestamp_seconds{}`]
 
 	// One repo's workflow listing starts failing: the other repo is still
-	// polled, the failing repo's series are kept, and the poll is not a
-	// success.
+	// polled and the failing repo's series are kept. The failure is the
+	// repo's, so the poll still counts as successful.
 	gh.mu.Lock()
 	gh.fail["/repos/octo-org/nightly/actions/workflows"] = http.StatusBadGateway
 	gh.runs[50] = append([]run{ghRun("octo-org/other", 502, now, "schedule", "failure")}, gh.runs[50]...)
@@ -848,9 +863,13 @@ func TestPollErrors(t *testing.T) {
 		t.Fatal("Poll succeeded despite a failing repo")
 	}
 	got := h.series(t)
+	if got[`gh_exporter_last_poll_success_timestamp_seconds{}`] <= okAt {
+		t.Errorf("one failing repo blocked the poll success timestamp")
+	}
+	okAt = got[`gh_exporter_last_poll_success_timestamp_seconds{}`]
 	assertSeries(t, got, map[string]float64{
-		`gh_exporter_poll_errors_total{kind=5xx}`:           1,
-		`gh_exporter_last_poll_success_timestamp_seconds{}`: okAt,
+		`gh_exporter_poll_errors_total{kind=5xx}`:                                                                                       1,
+		`gh_exporter_repo_poll_errors_total{kind=5xx,repo=octo-org/nightly}`:                                                            1,
 		`github_workflow_last_run_conclusion{branch=main,conclusion=failure,event=schedule,repo=octo-org/other,workflow=sync.yml}`:      1,
 		`github_workflow_last_run_conclusion{branch=main,conclusion=cancelled,event=schedule,repo=octo-org/nightly,workflow=build.yml}`: 1,
 	})
@@ -874,6 +893,12 @@ func TestPollErrors(t *testing.T) {
 		`github_workflow_last_run_conclusion{branch=main,conclusion=cancelled,event=schedule,repo=octo-org/nightly,workflow=build.yml}`: 1,
 	})
 
+	// Every repo failing is not a repo problem: the poll is unsuccessful.
+	if got := h.series(t)[`gh_exporter_last_poll_success_timestamp_seconds{}`]; got != okAt {
+		t.Errorf("poll with every repo failing advanced the success timestamp")
+	}
+	okAt = h.series(t)[`gh_exporter_last_poll_success_timestamp_seconds{}`]
+
 	// The installation listing failing aborts the poll but deletes nothing.
 	gh.mu.Lock()
 	gh.fail = map[string]int{"/installation/repositories": http.StatusInternalServerError}
@@ -884,6 +909,9 @@ func TestPollErrors(t *testing.T) {
 	got = h.series(t)
 	if got[`gh_exporter_watched_workflows{}`] != 3 {
 		t.Errorf("watched = %v after discovery failure, want 3", got[`gh_exporter_watched_workflows{}`])
+	}
+	if got[`gh_exporter_last_poll_success_timestamp_seconds{}`] != okAt {
+		t.Errorf("failed discovery advanced the success timestamp")
 	}
 }
 
@@ -1095,8 +1123,7 @@ func TestMissingContentsPermissionWarnsOnce(t *testing.T) {
 	// The poll fails, the workflows keep their series, and the warning is
 	// logged once however often it recurs.
 	gh.mu.Lock()
-	saved := gh.files[nightly]
-	delete(gh.files, nightly)
+	gh.noContents[nightly] = true
 	gh.mu.Unlock()
 	for range 2 {
 		if err := h.c.Poll(ctx); err == nil {
@@ -1112,16 +1139,19 @@ func TestMissingContentsPermissionWarnsOnce(t *testing.T) {
 	if got := h.series(t)[`gh_exporter_poll_errors_total{kind=404}`]; got != 2 {
 		t.Errorf("404 errors = %v, want 2", got)
 	}
+	if got := h.series(t)[`gh_exporter_repo_poll_errors_total{kind=404,repo=octo-org/nightly}`]; got != 2 {
+		t.Errorf("repo 404 errors = %v, want 2", got)
+	}
 
 	// Readable again, then hidden again: the warning fires anew.
 	gh.mu.Lock()
-	gh.files[nightly] = saved
+	delete(gh.noContents, nightly)
 	gh.mu.Unlock()
 	if err := h.c.Poll(ctx); err != nil {
 		t.Fatal(err)
 	}
 	gh.mu.Lock()
-	delete(gh.files, nightly)
+	gh.noContents[nightly] = true
 	gh.mu.Unlock()
 	_ = h.c.Poll(ctx)
 	if n := strings.Count(h.logs.String(), "Contents: read"); n != 2 {
@@ -1362,5 +1392,209 @@ func TestLastSuccessOnExhaustedHistory(t *testing.T) {
 				t.Errorf("last_success = %v (present %v), want %v", got, present, tt.want)
 			}
 		})
+	}
+}
+
+// TestRepoFailuresAndPollSuccess: a workflow directory absent from the
+// default branch is not an error, and one repo's failure does not keep the
+// poll from counting as successful; only global failures or every repo
+// failing do.
+func TestRepoFailuresAndPollSuccess(t *testing.T) {
+	const fresh = "octo-org/fresh"
+	const lastSuccess = `gh_exporter_last_poll_success_timestamp_seconds{}`
+	tests := []struct {
+		name string
+		// setup edits the fixture: nightly (healthy, scheduled) plus fresh,
+		// whose only, active workflow was registered from a PR branch, so
+		// its default branch has no .github/workflows.
+		setup       func(gh *fakeGitHub)
+		wantErr     bool
+		wantSuccess bool
+		wantSeries  map[string]float64
+		absent      []string
+		// permWarnings is how often the Contents: read hint is logged.
+		permWarnings int
+	}{
+		{
+			name:        "workflow only on a non-default branch",
+			setup:       func(*fakeGitHub) {},
+			wantSuccess: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_poll_errors_total{kind=404}`: 0,
+				`gh_exporter_watched_workflows{}`:         2,
+			},
+			absent: []string{`gh_exporter_repo_poll_errors_total`, `github_workflow_state{repo=octo-org/fresh`},
+		},
+		{
+			name: "sole repo without Contents: read",
+			setup: func(gh *fakeGitHub) {
+				gh.repos = []repository{{FullName: fresh, DefaultBranch: "main"}}
+				gh.noContents[fresh] = true
+			},
+			wantErr: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_poll_errors_total{kind=404}`:                          1,
+				`gh_exporter_repo_poll_errors_total{kind=404,repo=octo-org/fresh}`: 1,
+			},
+			permWarnings: 1,
+		},
+		{
+			name: "sole repo with its workflow directory refused",
+			setup: func(gh *fakeGitHub) {
+				gh.repos = []repository{{FullName: fresh, DefaultBranch: "main"}}
+				gh.fail["/repos/octo-org/fresh/contents/.github/workflows"] = http.StatusForbidden
+			},
+			wantErr: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_repo_poll_errors_total{kind=403,repo=octo-org/fresh}`: 1,
+			},
+		},
+		{
+			name:        "one repo without Contents: read among many",
+			setup:       func(gh *fakeGitHub) { gh.noContents[fresh] = true },
+			wantErr:     true,
+			wantSuccess: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_repo_poll_errors_total{kind=404,repo=octo-org/fresh}`: 1,
+				`gh_exporter_watched_workflows{}`:                                  2,
+			},
+			permWarnings: 1,
+		},
+		{
+			name: "root probe failing is a repo error",
+			setup: func(gh *fakeGitHub) {
+				gh.fail["/repos/octo-org/fresh/contents"] = http.StatusBadGateway
+			},
+			wantErr:     true,
+			wantSuccess: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_repo_poll_errors_total{kind=5xx,repo=octo-org/fresh}`: 1,
+			},
+		},
+		{
+			// Throttling is the installation's, not the repos': running out
+			// after the first repo must still fail the poll.
+			name: "rate limit hit mid-poll is global",
+			setup: func(gh *fakeGitHub) {
+				gh.repos = append(gh.repos, repository{FullName: "octo-org/third", DefaultBranch: "main"})
+				gh.fail["/repos/octo-org/fresh/actions/workflows"] = http.StatusTooManyRequests
+				gh.fail["/repos/octo-org/third/actions/workflows"] = http.StatusTooManyRequests
+			},
+			wantErr: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_poll_errors_total{kind=403}`: 2,
+				`gh_exporter_watched_workflows{}`:         2,
+			},
+			absent: []string{`gh_exporter_repo_poll_errors_total`},
+		},
+		{
+			name: "auth failure inside a repo is global",
+			setup: func(gh *fakeGitHub) {
+				gh.fail["/repos/octo-org/fresh/actions/workflows"] = http.StatusUnauthorized
+			},
+			wantErr: true,
+			wantSeries: map[string]float64{
+				`gh_exporter_poll_errors_total{kind=auth}`: 1,
+			},
+			absent: []string{`gh_exporter_repo_poll_errors_total`},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			gh := standardFixture(t, now)
+			gh.repos = append(gh.repos, repository{FullName: fresh, DefaultBranch: "main"})
+			gh.workflows[fresh] = []workflow{{ID: 60, Path: ".github/workflows/ci.yml", State: "active"}}
+			gh.runs[60] = []run{ghRun(fresh, 601, now.Add(-time.Hour), "pull_request", "success")}
+			tc.setup(gh)
+			h := newHarness(t, gh, standardConfig)
+
+			err := h.c.Poll(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Poll error = %v, wantErr %v", err, tc.wantErr)
+			}
+			got := h.series(t)
+			if success := got[lastSuccess] > 0; success != tc.wantSuccess {
+				t.Errorf("poll success recorded = %v, want %v (%s = %v)", success, tc.wantSuccess, lastSuccess, got[lastSuccess])
+			}
+			if h.c.Ready() != tc.wantSuccess {
+				t.Errorf("Ready = %v, want %v", h.c.Ready(), tc.wantSuccess)
+			}
+			assertSeries(t, got, tc.wantSeries)
+			assertAbsent(t, got, tc.absent...)
+			if n := strings.Count(h.logs.String(), "Contents: read"); n != tc.permWarnings {
+				t.Errorf("permission hint logged %d times, want %d", n, tc.permWarnings)
+			}
+		})
+	}
+}
+
+// TestWorkflowDirRemovedFromDefaultBranch: once the directory is proven gone
+// (root readable), the repo's workflows are no longer scheduled and lose
+// their series; a repo that disappears loses its error series.
+func TestWorkflowDirRemovedFromDefaultBranch(t *testing.T) {
+	gh := standardFixture(t, time.Now())
+	h := newHarness(t, gh, "")
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(workflowSeries(h.series(t), nightly, "build.yml")) == 0 {
+		t.Fatal("build.yml not watched")
+	}
+	gh.mu.Lock()
+	delete(gh.files, nightly)
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	got := h.series(t)
+	if got[`gh_exporter_watched_workflows{}`] != 0 {
+		t.Errorf("watched = %v, want 0", got[`gh_exporter_watched_workflows{}`])
+	}
+	assertAbsent(t, got, `github_workflow_`)
+
+	// A repo error series goes away with the repo.
+	gh.mu.Lock()
+	gh.fail["/repos/octo-org/nightly/actions/workflows"] = http.StatusBadGateway
+	gh.mu.Unlock()
+	_ = h.c.Poll(ctx)
+	assertSeries(t, h.series(t), map[string]float64{`gh_exporter_repo_poll_errors_total{kind=5xx,repo=octo-org/nightly}`: 1})
+	gh.mu.Lock()
+	gh.repos = nil
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertAbsent(t, h.series(t), `gh_exporter_repo_poll_errors_total`)
+}
+
+// TestHiddenDirWithOnlyInactiveWorkflows: a directory 404 is probed even when
+// no active workflow points into it, so a missing permission is an error
+// and never deletes the (disabled) workflows' series.
+func TestHiddenDirWithOnlyInactiveWorkflows(t *testing.T) {
+	gh := standardFixture(t, time.Now())
+	h := newHarness(t, gh, standardConfig)
+	ctx := context.Background()
+	if err := h.c.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gh.mu.Lock()
+	for i := range gh.workflows[nightly] {
+		gh.workflows[nightly][i].State = "disabled_manually"
+	}
+	gh.noContents[nightly] = true
+	gh.mu.Unlock()
+	if err := h.c.Poll(ctx); err == nil {
+		t.Fatal("poll succeeded with the workflow directory hidden")
+	}
+	got := h.series(t)
+	assertSeries(t, got, map[string]float64{
+		`github_workflow_state{repo=octo-org/nightly,state=disabled_manually,workflow=build.yml}`: 1,
+		`gh_exporter_repo_poll_errors_total{kind=404,repo=octo-org/nightly}`:                      1,
+		`gh_exporter_watched_workflows{}`:                                                         2,
+	})
+	if n := strings.Count(h.logs.String(), "Contents: read"); n != 1 {
+		t.Errorf("permission hint logged %d times, want 1", n)
 	}
 }
