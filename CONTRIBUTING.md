@@ -48,7 +48,8 @@ counts; the second poll should be almost entirely 304s.
 ## Documentation
 
 Keep documentation current as part of the change: update `README.md` (config,
-flags, metrics) in the same PR as the code.
+flags, metrics) and the matching clause in `docs/CONTRACT.md` in the same PR
+as the code. Test layout and fixtures are in `docs/TESTING.md`.
 
 ## Branching & commits
 

@@ -4,47 +4,78 @@
 
 A Prometheus exporter that authenticates as a GitHub App, discovers every
 scheduled GitHub Actions workflow in the installation, and exports run
-conclusion, last success, expected cron interval and workflow state.
-`README.md` is the user-facing contract (config, flags, metrics, alerts);
-metric names and labels are consumed by alert rules elsewhere, so treat them
-as a stable API.
+conclusion, last success, expected cron interval and workflow state. It polls;
+there are no webhooks.
 
-## Architecture
+- [`docs/CONTRACT.md`](docs/CONTRACT.md): metrics, run selection, `last_success`
+  rules, config and endpoints, each clause with its enforcing test. Read it
+  before changing anything a scrape, alert or probe can see.
+- [`docs/TESTING.md`](docs/TESTING.md): what CI runs, what each suite covers,
+  fixture conventions. Read it before adding or changing tests.
+- `README.md` is the user-facing doc; keep it in step with CONTRACT.
 
-| Path | Role |
-|---|---|
-| `main.go` | Flags/env (flags > env > defaults), credential + config loading, HTTP server (`/metrics`, `/healthz`, `/readyz`), signal handling |
-| `internal/config` | YAML config (include/exclude/overrides, strict keys, validation) and App credentials from env or the secret dir |
-| `internal/github` | Sequential REST client: App JWT → installation token (cached, re-minted <10 min before expiry, once on 401), ETag cache with per-poll eviction, Link pagination, error kinds, request stats |
-| `internal/cronx` | Expected interval = LONGEST gap in the merged fire sequence of all cron entries, walked day by day over 9 years (robfig/cron parsing, 5-field, UTC, DOW 7 = Sunday, floor 5m) |
-| `internal/collector` | The poll: discovery, workflow-file SHA cache + `on.schedule` parsing, run selection (client-side filtering; shallow ≤5×10 runs, then a deep ≤5×100 search only when no success is known), no-going-backwards merge, metric emission and series deletion |
-| `internal/version` | Build stamping via `-ldflags` |
+## Gotchas
 
-## Invariants
+- **`event=` / `branch=` on the runs listing look like the obvious filter.**
+  GitHub answers them from a lagging index that returns stale or empty results
+  with a `200`. Filter client-side; a test fails on any server-side filter.
+- **A `200` isn't the cheap response, a `304` is.** Conditional `If-None-Match`
+  requests that return `304` are not charged against the rate limit, which is
+  why every GET is ETag-revalidated. A new request path that skips the ETag
+  cache still returns correct data, just at full rate-limit cost.
+- **Schedules only fire on the default branch.** A `branch` override moves the
+  `last_run_*` series, never a scheduled workflow's `last_success`.
+- **`cancelled` is neither failure nor success.** It becomes the latest run but
+  leaves `last_success` alone; a cancel streak is meant to trip the Stale alert.
+  A manual or push success likewise says nothing about the schedule.
+- **State is in memory.** After a restart nothing is known, so the first poll
+  may need the deep (500-run) search, and `last_success` can be *absent* until
+  a success is found. Absent is deliberate; never fill it with `0`. Run one
+  replica.
+- **YAML 1.1 turns `on:` into `true:`.** Schedule parsing accepts the `true`
+  key only when no literal `on` exists; keep that preference.
+- **A `.github/workflows` 404 is ambiguous.** The Actions API can list a
+  workflow whose file isn't on the default branch (first registered from a
+  PR). The exporter tells the cases apart by listing the repo root: root
+  readable means the dir is really absent, root hidden too means the App
+  lacks Contents: read (a repo error that keeps series).
+- **`0` in the config means "use the default"**, not zero:
+  `default_grace_factor: 0` silently becomes `1.5`. An override's
+  `grace_factor: 0` is an error instead.
+- **Workflow-file problems don't fail the poll.** They are counted as `parse`
+  once per file version, and never fail the poll (see invariant 6).
 
-- Requests are strictly sequential (the client holds its lock across each
-  request). Never fan out.
-- Never pass `event=` or `branch=` to the runs listing; GitHub serves those
-  from a lagging index. A test asserts this.
-- Exactly one `github_workflow_last_run_conclusion`, `_last_run_url_info` and
-  `_state` series per workflow; a workflow that stops being watched loses
-  every series. A failed request never deletes series: only positive evidence
-  (listing succeeded and the thing is gone) does.
-- `last_success` semantics: a real success when found (or previously seen;
-  it always wins). When the run history was exhausted without one: the
-  workflow's `created_at` for scheduled workflows, `0` for include-list ones
-  (or when `created_at` is missing). *No series* when the search was capped
-  with nothing known. Never emit a value for "didn't look far enough".
-- A scheduled workflow's last success is always `event=schedule` on the
-  default branch; a `branch` override moves only `last_run_*`.
-- Per-workflow series are written under `metrics.mu`; Gather reads under its
-  read lock, so a label swap is atomic to scrapes.
-- A repo's own errors never block
-  `gh_exporter_last_poll_success_timestamp_seconds` or readiness; they go to
-  `gh_exporter_repo_poll_errors_total`. Only global failures (discovery,
-  auth, token mint, rate limiting, deadline) or every polled repo failing do.
-- A 404 on `.github/workflows` (active or disabled workflows) is "absent" when the
-  repo root is readable, and a missing-Contents-permission error only when
-  the root 404s too.
-- Never log the private key or the installation token.
-- Public repo: examples use neutral names (`octo-org/...`).
+## Invariants (violations are bugs)
+
+1. **Strictly sequential requests.** The client holds its lock across each
+   request. Never fan out.
+2. **Metric names, labels and semantics are a stable API** consumed by alert
+   rules outside this repo. Changes go through `docs/CONTRACT.md` first and
+   need `semver:major`.
+3. **One series per workflow** for `last_run_conclusion`, `last_run_url_info`
+   and `state`, swapped under `metrics.mu` so a scrape never sees two.
+4. **Only positive evidence deletes series.** A failed request keeps the last
+   values; a successful listing showing the thing gone removes every series.
+5. **Never emit a value for "didn't look far enough".** `last_success` follows
+   CONTRACT §3; observations never move backwards.
+6. **Only global failures block poll success.** One repo's errors go to
+   `gh_exporter_repo_poll_errors_total` and never hold back
+   `gh_exporter_last_poll_success_timestamp_seconds` or `/readyz`. Discovery,
+   auth, token mint, rate limiting, the poll deadline, or every polled repo
+   failing do (CONTRACT §5).
+7. **Public repo, no secrets in output.** Never log the private key or
+   installation token; examples use neutral names (`octo-org/...`) and no
+   environment-specific hosts or names.
+
+## Layout
+
+- `internal/cronx` computes the *longest* gap of the merged fire sequence of
+  all cron entries, not the average or the first cron's period.
+- `internal/collector/runs.go` holds selection and the merge; `collector.go`
+  holds discovery, the poll loop and when series are dropped (`dropUnseen`).
+
+## What lives where
+
+Anything needed to work in this repo (gotchas, invariants, contract) belongs
+here or in `docs/`, reviewed with the code. Agent-local memory is for
+machine-specific facts only and is never the sole copy of a rule.
